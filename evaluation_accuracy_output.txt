@@ -1,0 +1,8 @@
+columns: ['Question', 'Expected Answer', 'Actual Answer', 'Retrieved Context']
+expected_col: Expected Answer
+actual_col: Actual Answer
+rows: 20
+exact matches: 0
+accuracy: 0.0
+
+Sample rows:
