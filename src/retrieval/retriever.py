@@ -1,6 +1,96 @@
 from langchain_chroma import Chroma
 from embeddings.embedding_model import get_embedding_model
-from config import CHROMA_DB_PATH, COLLECTION_NAME, TOP_K
+from retrieval.sparse_retriever import SparseRetriever
+from config import (
+    CHROMA_DB_PATH,
+    COLLECTION_NAME,
+    SEARCH_TYPE,
+    RETRIEVAL_K,
+    SPARSE_K,
+    HYBRID_K,
+    HYBRID_DENSE_WEIGHT,
+)
+
+
+class HybridRetriever:
+    def __init__(
+        self,
+        dense_store,
+        sparse_retriever,
+        hybrid_k: int,
+        dense_k: int,
+        sparse_k: int,
+        dense_weight: float,
+    ):
+        self.dense_store = dense_store
+        self.sparse_retriever = sparse_retriever
+        self.hybrid_k = hybrid_k
+        self.dense_k = dense_k
+        self.sparse_k = sparse_k
+        self.dense_weight = dense_weight
+
+    def _doc_key(self, doc):
+        return doc.page_content[:300]
+
+    def _normalize_dense_scores(self, dense_results):
+        scores = [score for _, score in dense_results]
+        if not scores:
+            return []
+
+        min_score = min(scores)
+        max_score = max(scores)
+        if max_score == min_score:
+            return [1.0 for _ in scores]
+
+        return [(score - min_score) / (max_score - min_score) for score in scores]
+
+    def _sparse_score_transform(self, score: float) -> float:
+        return 1.0 / (1.0 + score) if score is not None else 0.0
+
+    def invoke(self, query: str):
+        dense_results = self.dense_store.similarity_search_with_score(query, k=self.dense_k)
+        sparse_docs = self.sparse_retriever.search(query, k=self.sparse_k)
+
+        normalized_dense_scores = self._normalize_dense_scores(dense_results)
+        combined = {}
+
+        for index, (doc, raw_score) in enumerate(dense_results):
+            key = self._doc_key(doc)
+            doc.metadata["retrieval_source"] = "dense"
+            doc.metadata["dense_score"] = raw_score
+            combined[key] = {
+                "doc": doc,
+                "dense": normalized_dense_scores[index],
+                "sparse": 0.0,
+            }
+
+        for doc in sparse_docs:
+            key = self._doc_key(doc)
+            sparse_score = self._sparse_score_transform(doc.metadata.get("score", 0.0))
+            doc.metadata["retrieval_source"] = "sparse"
+            doc.metadata["sparse_score"] = doc.metadata.get("score", 0.0)
+
+            if key in combined:
+                combined[key]["sparse"] = sparse_score
+                combined[key]["doc"].metadata["retrieval_source"] = "dense+sparse"
+            else:
+                combined[key] = {
+                    "doc": doc,
+                    "dense": 0.0,
+                    "sparse": sparse_score,
+                }
+
+        scored_docs = []
+        for entry in combined.values():
+            entry["combined"] = (
+                self.dense_weight * entry["dense"]
+                + (1.0 - self.dense_weight) * entry["sparse"]
+            )
+            scored_docs.append(entry)
+
+        scored_docs.sort(key=lambda entry: entry["combined"], reverse=True)
+
+        return [entry["doc"] for entry in scored_docs[: self.hybrid_k]]
 
 
 def get_retriever():
@@ -13,12 +103,13 @@ def get_retriever():
         collection_name=COLLECTION_NAME,
     )
 
-    retriever = db.as_retriever(
-        search_type="mmr",
-        search_kwargs={
-            "k":5,
-            "fetch_k":20
-        }
-    )
+    sparse_retriever = SparseRetriever()
 
-    return retriever
+    return HybridRetriever(
+        db,
+        sparse_retriever,
+        HYBRID_K,
+        RETRIEVAL_K,
+        SPARSE_K,
+        HYBRID_DENSE_WEIGHT,
+    )

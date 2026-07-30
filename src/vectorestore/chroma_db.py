@@ -1,6 +1,7 @@
 from langchain_chroma import Chroma
 from embeddings.embedding_model import get_embedding_model
 from config import CHROMA_DB_PATH, COLLECTION_NAME
+from retrieval.sparse_retriever import create_sparse_index
 
 def create_vector_db(chunks):
 
@@ -12,5 +13,7 @@ def create_vector_db(chunks):
         persist_directory=CHROMA_DB_PATH,
         collection_name=COLLECTION_NAME
     )
+
+    create_sparse_index(chunks)
 
     return db

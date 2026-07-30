@@ -1,39 +1,14 @@
-from langchain_chroma import Chroma
 from langchain_ollama import ChatOllama
-
-from embeddings.embedding_model import get_embedding_model
-from config import (
-    CHROMA_DB_PATH,
-    COLLECTION_NAME,
-    OLLAMA_MODEL,
-)
+from reranker import rerank
+from retrieval.retriever import get_retriever
+from config import OLLAMA_MODEL, TOP_K
 
 # ---------------------------------------------------
-# Load Embedding Model
+# Load Retriever
 # ---------------------------------------------------
-embedding_model = get_embedding_model()
-
-# ---------------------------------------------------
-# Load ChromaDB
-# ---------------------------------------------------
-print("initializing ChromaDB...")
-db = Chroma(
-    persist_directory=CHROMA_DB_PATH,
-    embedding_function=embedding_model,
-    collection_name=COLLECTION_NAME,
-)
-print("ChromaDB initialized successfully.")
-# ---------------------------------------------------
-# MMR Retriever
-# ---------------------------------------------------
-retriever = db.as_retriever(
-    search_type="mmr",
-    search_kwargs={
-        "k": 5,
-        "fetch_k": 70,
-        "lambda_mult": 0.85,
-    },
-)
+print("initializing Retriever...")
+retriever = get_retriever()
+print("Retriever initialized successfully.")
 
 # ---------------------------------------------------
 # Load Local LLM
@@ -106,6 +81,7 @@ def ask_question(question):
 
     # ---------- Retrieve ----------
     docs = retriever.invoke(question)
+    docs = rerank(question, docs, top_k=TOP_K)
 
     print("\n================ RETRIEVED CHUNKS ================\n")
 

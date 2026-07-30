@@ -1,3 +1,5 @@
+import sys
+
 from retrieval.retriever import get_retriever
 
 retriever = get_retriever()
@@ -21,5 +23,9 @@ for i, doc in enumerate(results):
     print(doc.metadata)
 
     print("\nContent:\n")
-
-    print(doc.page_content[:1000])
+    snippet = doc.page_content[:1000]
+    try:
+        print(snippet)
+    except UnicodeEncodeError:
+        safe_snippet = snippet.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace")
+        print(safe_snippet)
