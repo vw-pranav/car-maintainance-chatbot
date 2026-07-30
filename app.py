@@ -9,12 +9,13 @@ from datetime import datetime
 sys.path.append("src")
 
 from chatbot import ask_question
+from history_db import HistoryStore
 
 st.set_page_config(
     page_title="GarageGPT",
     page_icon="🔧",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="locked",
 )
 
 st.markdown("""
@@ -249,13 +250,17 @@ if "messages" not in st.session_state:
 if "documents" not in st.session_state:
     st.session_state.documents = []
 if "chat_sessions" not in st.session_state:
-    st.session_state.chat_sessions = [
-        {"title": "Brake pedal spongy fix", "time": "2h ago"},
-        {"title": "P0420 catalyst code", "time": "Yesterday"},
-        {"title": "Diesel injector cleaning steps", "time": "2 days ago"},
-    ]
+    st.session_state.chat_sessions = []
 if "greeting" not in st.session_state:
     st.session_state.greeting = random.choice(GREETINGS)
+if "active_session_id" not in st.session_state:
+    st.session_state.active_session_id = None
+
+history_store = HistoryStore(os.path.join(os.getcwd(), "garagegpt_history.db"))
+
+if st.session_state.active_session_id is None:
+    st.session_state.active_session_id = history_store.create_session("New conversation")
+    st.session_state.chat_sessions = history_store.get_recent_sessions()
 
 
 def get_logo_b64(path="logo.jpg"):
@@ -268,14 +273,34 @@ def get_logo_b64(path="logo.jpg"):
 
 
 def process_uploaded_file(uploaded_file):
-    """
-    TODO: wire this into your actual ingestion pipeline:
-    - extract text (PDF/DOCX/TXT parsing)
-    - chunk it
-    - embed with nomic-embed-text
-    - upsert into ChromaDB
-    """
     return {"name": uploaded_file.name, "size_kb": round(uploaded_file.size / 1024, 1)}
+
+
+def persist_chat_turn(session_id: int, user_query: str, answer: str, context: str) -> None:
+    history_store.save_message(session_id, "user", user_query)
+    history_store.save_message(session_id, "assistant", answer)
+    history_store.update_session_title(session_id, user_query[:40] if user_query else "Conversation")
+
+
+def persist_uploaded_document(session_id: int, doc: dict) -> None:
+    history_store.save_document(session_id, doc["name"], doc["size_kb"])
+
+
+def load_session(session_id: int) -> None:
+    session = history_store.get_session(session_id)
+    if not session:
+        return
+
+    st.session_state.active_session_id = session_id
+    st.session_state.messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in history_store.get_session_messages(session_id)
+    ]
+    st.session_state.documents = [
+        {"name": doc["name"], "size_kb": doc["size_kb"]}
+        for doc in history_store.get_session_documents(session_id)
+    ]
+    st.session_state.chat_sessions = history_store.get_recent_sessions()
 
 
 def get_bot_response(user_query: str) -> dict:
@@ -307,6 +332,8 @@ with st.sidebar:
     if st.button("➕  New chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.greeting = random.choice(GREETINGS)
+        st.session_state.active_session_id = history_store.create_session("New conversation")
+        st.session_state.chat_sessions = history_store.get_recent_sessions()
         st.rerun()
 
     st.markdown('<div class="section-label">Reference Documents</div>', unsafe_allow_html=True)
@@ -320,7 +347,9 @@ with st.sidebar:
         for uploaded_file in uploaded:
             existing_names = [doc["name"] for doc in st.session_state.documents]
             if uploaded_file.name not in existing_names:
-                st.session_state.documents.append(process_uploaded_file(uploaded_file))
+                doc = process_uploaded_file(uploaded_file)
+                st.session_state.documents.append(doc)
+                persist_uploaded_document(st.session_state.active_session_id, doc)
 
     if st.session_state.documents:
         for doc in st.session_state.documents:
@@ -334,13 +363,26 @@ with st.sidebar:
         st.caption("No documents indexed yet")
 
     st.markdown('<div class="section-label">Chat History</div>', unsafe_allow_html=True)
+    st.session_state.chat_sessions = history_store.get_recent_sessions()
     for chat in st.session_state.chat_sessions:
-        st.markdown(f"""
-            <div class="history-item">
-                💬 {chat['title']}
-                <div class="history-time">{chat['time']}</div>
-            </div>
-        """, unsafe_allow_html=True)
+        col1, col2 = st.columns([0.85, 0.15])
+        with col1:
+            if st.button(
+                f"💬 {chat['title']}\n{chat['updated_at']}",
+                key=f"history_{chat['id']}",
+                use_container_width=True,
+            ):
+                load_session(chat['id'])
+                st.rerun()
+        with col2:
+            if st.button("🗑", key=f"delete_{chat['id']}", use_container_width=True):
+                history_store.delete_session(chat['id'])
+                st.session_state.chat_sessions = history_store.get_recent_sessions()
+                if st.session_state.active_session_id == chat['id']:
+                    st.session_state.active_session_id = None
+                    st.session_state.messages = []
+                    st.session_state.documents = []
+                st.rerun()
 
 if not st.session_state.messages:
     emoji, headline = st.session_state.greeting
@@ -367,6 +409,7 @@ if not st.session_state.messages:
             "content": response["answer"],
             "context": response["context"],
         })
+        persist_chat_turn(st.session_state.active_session_id, clicked_suggestion, response["answer"], response["context"])
         st.rerun()
 else:
     for msg in st.session_state.messages:
@@ -395,4 +438,5 @@ if prompt:
         "content": response["answer"],
         "context": response["context"],
     })
+    persist_chat_turn(st.session_state.active_session_id, prompt, response["answer"], response["context"])
     st.rerun()
