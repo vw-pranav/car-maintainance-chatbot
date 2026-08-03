@@ -14,7 +14,13 @@ def rerank(question, docs, top_k=8):
     for doc in docs:
         pairs.append((question, doc.page_content))
 
+
+    print(f"\nReranking {len(pairs)} chunks...")
+    print(pairs[:3])
+
+    
     scores = reranker.predict(pairs)
+    print(f"Scores: {scores[:3]}")
 
     ranked = sorted(
         zip(scores, docs),
@@ -23,6 +29,7 @@ def rerank(question, docs, top_k=8):
     )
 
     print("\n=========== RERANK SCORES ===========")
+    print(f"Ranked: {ranked[:3]}")
 
     for score, doc in ranked:
         print(f"{score:.4f}")
