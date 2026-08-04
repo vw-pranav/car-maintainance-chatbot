@@ -303,8 +303,8 @@ def load_session(session_id: int) -> None:
     st.session_state.chat_sessions = history_store.get_recent_sessions()
 
 
-def get_bot_response(user_query: str) -> dict:
-    result = ask_question(user_query)
+def get_bot_response(user_query: str, history: list | None = None) -> dict:
+    result = ask_question(user_query, history=history)
     return {
         "answer": result["answer"],
         "context": result["context"],
@@ -402,7 +402,11 @@ if not st.session_state.messages:
             if st.button(suggestion, key=f"sugg_{i}", use_container_width=True):
                 clicked_suggestion = suggestion.split("  ", 1)[1] if "  " in suggestion else suggestion
     if clicked_suggestion:
-        response = get_bot_response(clicked_suggestion)
+        history_for_prompt = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in st.session_state.messages
+        ]
+        response = get_bot_response(clicked_suggestion, history=history_for_prompt)
         st.session_state.messages.append({"role": "user", "content": clicked_suggestion})
         st.session_state.messages.append({
             "role": "assistant",
@@ -428,7 +432,11 @@ if prompt:
 
     with st.chat_message("assistant", avatar="🔧"):
         with st.spinner("Checking the manuals…"):
-            response = get_bot_response(prompt)
+            history_for_prompt = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in st.session_state.messages
+            ]
+            response = get_bot_response(prompt, history=history_for_prompt)
         st.markdown(response["answer"])
         with st.expander("View retrieved context", expanded=False):
             st.text(response["context"])

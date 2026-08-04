@@ -48,3 +48,9 @@ node_modules/
 .streamlit/secrets.toml
 
 data/raw/
+
+
+
+garagegpt_history.db
+ 
+ 

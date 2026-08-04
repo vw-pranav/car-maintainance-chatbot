@@ -4,12 +4,14 @@ from langchain_ollama import ChatOllama
 from reranker import rerank
 from retrieval.retriever import get_retriever
 from config import OLLAMA_MODEL, TOP_K
+from conversation_memory import ThreadedConversationMemory, create_history_aware_retriever
 
 # ---------------------------------------------------
 # Load Retriever
 # ---------------------------------------------------
 print("initializing Retriever...")
 retriever = get_retriever()
+history_aware_retriever = create_history_aware_retriever(retriever)
 print("Retriever initialized successfully.")
 
 # ---------------------------------------------------
@@ -59,7 +61,8 @@ def clean_context(text):
             continue
 
         if re.match(r"^(installing|removal|inspection|testing|summary|overview|removing and installing)\b", lower):
-            continue
+            if "engine" not in lower and "transmission" not in lower and "subframe" not in lower:
+                continue
 
         if len(lower) < 5:
             continue
@@ -99,9 +102,366 @@ def remove_duplicates(chunks):
     return unique
 
 
-def build_answer_prompt(question, context):
+def _normalize_text(text):
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _extract_keywords(text):
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    stop_words = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "what",
+        "when",
+        "why",
+        "how",
+        "can",
+        "you",
+        "your",
+        "about",
+        "is",
+        "it",
+        "be",
+        "of",
+        "to",
+        "a",
+        "an",
+        "are",
+        "was",
+        "were",
+        "does",
+        "do",
+        "did",
+        "into",
+        "on",
+        "in",
+        "as",
+    }
+    return [token for token in tokens if token not in stop_words and len(token) >= 3]
+
+
+def _is_followup_question(question, history=None):
+    if not history:
+        return False
+
+    q = (question or "").strip().lower()
+    if not q:
+        return False
+
+    short_followups = ["why", "how", "what about", "that", "this", "it", "again", "explain", "elaborate", "more"]
+    if len(q.split()) <= 6 and any(marker in q for marker in short_followups):
+        return True
+
+    return False
+
+
+def _build_history_topic_terms(history):
+    if not history:
+        return []
+
+    combined_text = []
+    for turn in history[-8:]:
+        content = (turn.get("content") or "").strip()
+        if content:
+            combined_text.append(content)
+
+    combined_text = " ".join(combined_text)
+    keywords = _extract_keywords(combined_text)
+
+    if "ea839" in combined_text.lower():
+        keywords.insert(0, "ea839")
+    if "engine" in combined_text.lower():
+        keywords.append("engine")
+    if "remov" in combined_text.lower() or "remove" in combined_text.lower():
+        keywords.append("removal")
+    if "transmission" in combined_text.lower():
+        keywords.append("transmission")
+    if "subframe" in combined_text.lower():
+        keywords.append("subframe")
+
+    return list(dict.fromkeys(keywords))
+
+
+def build_retrieval_query(question, history=None):
+    base_question = (question or "").strip()
+    if not history:
+        return base_question
+
+    topic_terms = _build_history_topic_terms(history)
+    if not topic_terms:
+        return base_question
+
+    if _is_followup_question(base_question, history):
+        expanded_terms = [base_question]
+        expanded_terms.extend(topic_terms[:10])
+        return " ".join(expanded_terms)
+
+    if len(base_question.split()) <= 8:
+        return f"{base_question} {' '.join(topic_terms[:8])}"
+
+    return base_question
+
+
+def build_secondary_retrieval_query(question, history=None):
+    base_query = build_retrieval_query(question, history=history)
+    lowered = (base_query or "").lower()
+    if "engine" in lowered and ("remov" in lowered or "remove" in lowered or "removal" in lowered):
+        return f"{base_query} engine removal procedure transmission subframe"
+    return base_query
+
+
+def score_chunk_relevance(question, doc):
+    if not doc:
+        return 0.0
+
+    content = _normalize_text(getattr(doc, "page_content", "") or "")
+    metadata = getattr(doc, "metadata", {}) or {}
+    section_hints = metadata.get("section_hints", [])
+    if isinstance(section_hints, str):
+        section_hints = [section_hints]
+    section_text = " ".join([str(item) for item in section_hints if item])
+
+    question_lower = (question or "").lower()
+    content_lower = content.lower()
+    section_lower = section_text.lower()
+
+    score = 0.0
+
+    if "engine" in question_lower:
+        if "engine" in content_lower:
+            score += 3.0
+        if "remov" in content_lower or "remove" in content_lower:
+            score += 3.5
+        if "transmission" in content_lower or "subframe" in content_lower:
+            score += 2.5
+        if any(term in section_lower for term in ["engine removal", "engine assembly", "removing and installing", "removal procedure", "repair group"]):
+            score += 4.0
+
+    if "remov" in question_lower or "remove" in question_lower:
+        if "remov" in content_lower or "remove" in content_lower:
+            score += 2.0
+
+    if any(term in content_lower for term in ["coolant", "fuel injection", "ignition", "compressor", "electrical compressor"]):
+        score -= 5.0
+
+    if "engine" in content_lower and any(term in content_lower for term in ["transmission", "subframe", "assembly", "removal"]):
+        score += 2.0
+
+    return round(score, 2)
+
+
+def is_context_relevant(question, docs):
+    if not docs:
+        return False
+
+    scores = [score_chunk_relevance(question, doc) for doc in docs]
+    if not scores:
+        return False
+
+    return max(scores) >= 6.0
+
+
+def get_question_explanation_guidance(question, history=None):
+    question_lower = (question or "").lower()
+    guidance = [
+        "If the question asks how, explain the process, steps, or method clearly.",
+        "If the question asks why, explain the reason, purpose, or cause clearly.",
+        "Treat the current question as part of the ongoing conversation, not as a brand-new topic.",
+        "Use the chat memory to resolve what the user is referring to, especially for short follow-ups such as why, how, that, this, it, what about, or again.",
+        "Remember the previous user question and the previous assistant answer, and answer the new question in that context.",
+        "If the current question is simply 'why' or another short follow-up, explain the previous assistant answer directly and not as a new unrelated topic.",
+        "Do not ignore the earlier turns in the conversation.",
+        "If the current question is related to the previous exchange, stay on that same topic and explain it using the chat memory.",
+    ]
+
+    if history:
+        guidance.append("Always consider the earlier turns in this chat before answering.")
+
+    if not any(word in question_lower for word in ["how", "why"]):
+        guidance.append("Explain the answer clearly and directly.")
+
+    return "\n".join(guidance)
+
+
+def build_followup_context(history):
+    if not history:
+        return ""
+
+    recent_turns = []
+    for turn in history[-6:]:
+        role = (turn.get("role") or "").strip()
+        content = (turn.get("content") or "").strip()
+        if content:
+            recent_turns.append(f"{role.capitalize()}: {content}")
+
+    if not recent_turns:
+        return ""
+
+    memory_lines = []
+    if len(history) > 6:
+        memory_lines.append("Conversation summary: the user is continuing an earlier topic; keep the current answer aligned with the previous exchange.")
+
+    memory_lines.extend(recent_turns)
+    joined = "\n".join(memory_lines)
+    return f"""
+========================
+CHAT MEMORY
+========================
+
+{joined}
+
+"""
+
+
+def build_retrieval_query(question, history=None):
+    question_lower = (question or "").lower().strip()
+    if not history:
+        return question
+
+    followup_context = build_followup_context(history)
+    if followup_context:
+        return f"Conversation context:\n{followup_context}\nCurrent question: {question}"
+
+    return question
+
+
+def is_reasoning_question(question):
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+    reasoning_markers = [
+        "why",
+        "reason",
+        "purpose",
+        "what is the reason",
+        "why is it",
+        "why is this",
+        "why is that",
+        "why is it done",
+        "what is the purpose",
+        "explain why",
+        "can you explain why",
+    ]
+    return any(marker in q for marker in reasoning_markers)
+
+
+def _extract_reason_from_context(context):
+    if not context:
+        return None
+
+    lowered = (context or "").lower()
+    reason_phrases = [
+        "reason",
+        "because",
+        "to allow",
+        "to avoid",
+        "to reduce",
+        "to enable",
+        "to facilitate",
+        "so that",
+        "this is done",
+        "the engine is removed",
+    ]
+
+    if any(phrase in lowered for phrase in reason_phrases):
+        return context.strip()
+
+    return None
+
+
+def validate_reasoning_answer(question, context, answer):
+    if not is_reasoning_question(question):
+        return answer
+
+    context_lower = (context or "").lower()
+    answer_lower = (answer or "").lower()
+
+    warning_markers = [
+        "warning",
+        "caution",
+        "risk of injury",
+        "injury",
+        "safety",
+        "tool requirement",
+        "must be used",
+        "do not",
+        "danger",
+        "hazard",
+    ]
+
+    if any(marker in context_lower for marker in warning_markers):
+        if any(marker in answer_lower for marker in warning_markers):
+            return "The documentation does not explicitly explain the reason for the procedure; it only describes a warning or caution."
+
+    if _extract_reason_from_context(context):
+        return answer
+
+    return "The documentation describes the procedure but does not explicitly explain the reason."
+
+
+def build_answer_prompt(question, context, history=None):
+    explanation_guidance = get_question_explanation_guidance(question, history=history)
+    history_text = ""
+    followup_context = build_followup_context(history)
+
+    if history:
+        recent_history = []
+        for turn in history[-4:]:
+            role = turn.get("role", "user").capitalize()
+            content = (turn.get("content") or "").strip()
+            if content:
+                recent_history.append(f"{role}: {content}")
+
+        if recent_history:
+            history_text = f"""
+========================
+CONVERSATION HISTORY
+========================
+
+{"\n".join(recent_history)}
+
+"""
+
+    reasoning_instruction = ""
+    if is_reasoning_question(question):
+        reasoning_instruction = """
+For reasoning questions such as why, explain the documented reason only when the context explicitly states one.
+Do not treat warnings, cautions, safety notices, tool requirements, or injury notices as the reason for a procedure unless the documentation explicitly says so.
+If the retrieved documentation describes the procedure but does not explicitly state the reason, say that clearly.
+Use this exact structure:
+Answer:
+<direct answer>
+
+Why:
+<documented reason OR documentation does not specify>
+
+How We Know:
+<supporting evidence>
+
+Possible Explanation (Inference):
+<only if the reason is not documented>
+
+Additional Information:
+<optional>
+"""
+
     return f"""
 You are a professional Automotive Maintenance Assistant.
+
+You are also a conversational memory assistant. The current question may be a follow-up to earlier turns in this chat.
+
+Important memory rules:
+- If the current question refers to earlier conversation, resolve that reference using the CHAT MEMORY.
+- Do not treat short follow-ups such as "why", "how", "that", "this", "it", "what about", or "again" as unrelated new questions.
+- If the user asks "why" after a previous answer, explain that previous answer directly and stay on that same topic, not as a new unrelated topic.
+- Use the previous user question and previous assistant answer to understand what the user means.
+- If the current question is related to the previous exchange, answer it in that same context.
+- Keep the answer focused on the topic the user is continuing.
 
 Use the provided Context as supporting evidence, not as the final answer itself.
 
@@ -110,9 +470,11 @@ Your task is to synthesize the retrieved information into a clear, fluent, and h
 Core rules:
 - Answer only from the provided Context.
 - Synthesize the information into a natural, conversational answer.
-- Rephrase the information in your own words.
+- Rephrase the information in your own words and explain it clearly.
 - Do not quote large portions of the retrieved text.
 - Do not copy raw PDF snippets or present the context verbatim.
+- Use the retrieved evidence as support, but write the final answer as a helpful assistant would, not as a document excerpt.
+- If the Context contains a direct instruction or fact, paraphrase it naturally and keep the meaning intact.
 - Do not use outside knowledge or fill gaps with assumptions.
 - Do not invent missing steps, tools, values, warnings, or procedures.
 - If the Context does not contain enough information, say so briefly instead of guessing.
@@ -130,11 +492,33 @@ Grounding rules:
 Style rules:
 - Write in a professional, helpful, conversational tone.
 - Prefer concise paragraphs or short bullet points.
+- Use natural, direct wording that sounds like a helpful assistant.
+- Keep sentences clear and easy to follow, rather than formal or overly technical.
+- Add a brief bit of context or explanation when useful, as a real assistant would.
+- {explanation_guidance}
+- {reasoning_instruction}
+- When appropriate, include a short follow-up phrase such as "If you want, I can also help with..." or "For this task, the key point is...".
 - Organize the answer clearly with headings when useful, such as Summary, Steps, Warnings, Required tools, or Final checks.
 - Add light explanation where it helps, but do not add unsupported details.
 - Avoid responses that look like raw document excerpts.
 
 If the question is ambiguous and different procedures may apply, ask one short clarification question.
+
+Response format:
+Answer:
+<direct answer>
+
+Why:
+<reasoning and explanation>
+
+How We Know:
+<summary of the relevant information found in the retrieved documents>
+
+Additional Information:
+<helpful recommendations, cautions, or contextual information>
+
+If the information is not available in the retrieved documents, say exactly:
+I could not find this information in the available documentation.
 
 ========================
 CONTEXT
@@ -142,6 +526,7 @@ CONTEXT
 
 {context}
 
+{followup_context}{history_text}
 ========================
 QUESTION
 ========================
@@ -154,7 +539,10 @@ ANSWER
 """
 
 
-def build_verification_prompt(question, context, draft_answer):
+def build_verification_prompt(question, context, draft_answer, history=None):
+    explanation_guidance = get_question_explanation_guidance(question, history=history)
+    memory_context = build_followup_context(history)
+
     return f"""
 Review the draft answer below for grounding and synthesis quality.
 
@@ -163,10 +551,22 @@ Rules:
 - Remove any sentence or bullet that is not directly supported by the Context.
 - Rewrite the remaining content into a concise, natural, professional answer.
 - Make the answer sound like a helpful AI assistant, not like copied document text.
+- Paraphrase the key point in your own words while preserving the meaning from the Context.
+- Avoid repeating source wording too closely; instead, express it as a clear explanation.
+- Prefer short, natural sentences and a conversational tone over formal document language.
+- Give a slightly fuller answer than a one-line response when the Context supports it, so the reply feels helpful and complete.
+- Use the chat memory to understand follow-up questions and keep the answer tied to the earlier topic.
+- For a follow-up such as 'why', explain the earlier answer, not a new unrelated topic.
+- {explanation_guidance}
+- Keep the final answer in this structure:
+  Answer:
+  Why:
+  How We Know:
+  Additional Information:
 - Do not add any information that is not present in the Context.
 - If the Context does not support the answer, reply exactly:
 
-I don't know.
+I could not find this information in the available documentation.
 - Preserve explicit negatives such as 'cannot be reused', 'must not be reused', or 'do not use' when they appear in the Context.
 
 ========================
@@ -175,6 +575,7 @@ CONTEXT
 
 {context}
 
+{memory_context}
 ========================
 QUESTION
 ========================
@@ -189,6 +590,57 @@ DRAFT ANSWER
 
 ========================
 VERIFIED ANSWER
+========================
+"""
+
+
+def build_rewrite_prompt(question, context, draft_answer, history=None):
+    explanation_guidance = get_question_explanation_guidance(question, history=history)
+    memory_context = build_followup_context(history)
+
+    return f"""
+Rewrite the draft answer into a more natural assistant-style response.
+
+Rules:
+- Keep the same factual meaning as the Context and the draft answer.
+- Do not copy the source wording directly.
+- Use a conversational, helpful tone that feels like a real chatbot.
+- Start with a natural opener such as "Sure" or "The key point is" when appropriate.
+- Include a brief explanation or context if it helps the response feel complete.
+- Use the chat memory to understand follow-up questions and keep the answer tied to the earlier topic.
+- For a follow-up such as 'why', explain the earlier answer, not a new unrelated topic.
+- {explanation_guidance}
+- Preserve the structure below in the rewritten answer:
+  Answer:
+  Why:
+  How We Know:
+  Additional Information:
+- Stay grounded in the Context only.
+- If the Context does not support the answer, reply exactly:
+
+I could not find this information in the available documentation.
+
+========================
+CONTEXT
+========================
+
+{context}
+
+{memory_context}
+========================
+QUESTION
+========================
+
+{question}
+
+========================
+DRAFT ANSWER
+========================
+
+{draft_answer}
+
+========================
+REWRITTEN ANSWER
 ========================
 """
 
@@ -210,25 +662,56 @@ def enforce_grounding_for_negation(question, context, answer):
         ]
         if any(pattern in context_lower for pattern in negation_patterns):
             if any(affirmative in answer_lower for affirmative in ["yes", "can", "reused again"]):
-                return "Used coolant cannot be reused again."
+                return "The information indicates that it should not be reused."
 
-    return answer
+    return re.sub(r"\s+", " ", answer or "").strip()
 
 
 # ---------------------------------------------------
 # Ask Question
 # ---------------------------------------------------
-def ask_question(question):
+def ask_question(question, history=None, session_id=None):
+
+    memory = None
+    if session_id:
+        memory = ThreadedConversationMemory(session_id=session_id)
+        if history is None:
+            history = memory.get_messages()
 
     # ---------- Retrieve ----------
-    docs = retriever.invoke(question)
-    docs = rerank(question, docs, top_k=TOP_K)
+    retrieval_query = build_retrieval_query(question, history=history)
+    if session_id:
+        history_retriever = create_history_aware_retriever(retriever, memory_manager=memory)
+        docs = history_retriever.retrieve(question, session_id=session_id)
+    else:
+        docs = retriever.invoke(retrieval_query)
+    docs = rerank(retrieval_query, docs, top_k=TOP_K)
 
     print("\n================ RETRIEVED CHUNKS ================\n")
 
+    relevant_docs = [doc for doc in docs if score_chunk_relevance(retrieval_query, doc) >= 6.0]
+
+    if not relevant_docs:
+        secondary_query = build_secondary_retrieval_query(question, history=history)
+        if secondary_query != retrieval_query:
+            alt_docs = retriever.invoke(secondary_query)
+            alt_docs = rerank(secondary_query, alt_docs, top_k=TOP_K)
+            relevant_docs = [doc for doc in alt_docs if score_chunk_relevance(secondary_query, doc) >= 6.0]
+            if relevant_docs:
+                docs = alt_docs
+                retrieval_query = secondary_query
+
+    if not relevant_docs:
+        fallback_answer = "I could not find a direct answer to this question in the retrieved documentation."
+        return {
+            "question": question,
+            "answer": fallback_answer,
+            "context": "",
+        }
+
     cleaned_chunks = []
 
-    for i, doc in enumerate(docs, start=1):
+    for i, doc in enumerate(relevant_docs, start=1):
 
         cleaned = clean_context(doc.page_content)
 
@@ -242,14 +725,26 @@ def ask_question(question):
 
     context = format_context_for_generation(cleaned_chunks)
 
-    answer_prompt = build_answer_prompt(question, context)
+    answer_prompt = build_answer_prompt(question, context, history=history)
     draft_response = llm.invoke(answer_prompt)
     draft_answer = draft_response.content.strip()
 
-    verification_prompt = build_verification_prompt(question, context, draft_answer)
+    if is_reasoning_question(question):
+        draft_answer = validate_reasoning_answer(question, context, draft_answer)
+
+    verification_prompt = build_verification_prompt(question, context, draft_answer, history=history)
     verified_response = llm.invoke(verification_prompt)
-    final_answer = verified_response.content.strip()
+    verified_answer = verified_response.content.strip()
+
+    rewrite_prompt = build_rewrite_prompt(question, context, verified_answer, history=history)
+    rewritten_response = llm.invoke(rewrite_prompt)
+    final_answer = rewritten_response.content.strip()
     final_answer = enforce_grounding_for_negation(question, context, final_answer)
+
+    if session_id:
+        memory = ThreadedConversationMemory(session_id=session_id)
+        memory.add_user_message(question)
+        memory.add_ai_message(final_answer)
 
     return {
         "question": question,
