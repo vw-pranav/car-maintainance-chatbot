@@ -1,13 +1,21 @@
 from chatbot import ask_question
 
-while True:
+chat_history = []
 
-    question = input("\nAsk: ")
+while True:
+    question = input("\nAsk: ").strip()
+
+    if not question:
+        continue
 
     if question.lower() == "exit":
         break
 
-    result = ask_question(question)
+    chat_history.append({"role": "user", "content": question})
+    result = ask_question(question, history=chat_history)
+    answer = result["answer"]
+
+    chat_history.append({"role": "assistant", "content": answer})
 
     print("\n================ ANSWER ================\n")
-    print(result["answer"])
+    print(answer)
