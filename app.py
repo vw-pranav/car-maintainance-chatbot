@@ -303,8 +303,8 @@ def load_session(session_id: int) -> None:
     st.session_state.chat_sessions = history_store.get_recent_sessions()
 
 
-def get_bot_response(user_query: str, history: list | None = None) -> dict:
-    result = ask_question(user_query, history=history)
+def get_bot_response(user_query: str, history: list | None = None, session_id: int | None = None) -> dict:
+    result = ask_question(user_query, history=history, session_id=session_id)
     return {
         "answer": result["answer"],
         "context": result["context"],
@@ -406,7 +406,11 @@ if not st.session_state.messages:
             {"role": msg["role"], "content": msg["content"]}
             for msg in st.session_state.messages
         ]
-        response = get_bot_response(clicked_suggestion, history=history_for_prompt)
+        response = get_bot_response(
+            clicked_suggestion,
+            history=history_for_prompt,
+            session_id=st.session_state.active_session_id,
+        )
         st.session_state.messages.append({"role": "user", "content": clicked_suggestion})
         st.session_state.messages.append({
             "role": "assistant",
@@ -436,7 +440,11 @@ if prompt:
                 {"role": msg["role"], "content": msg["content"]}
                 for msg in st.session_state.messages
             ]
-            response = get_bot_response(prompt, history=history_for_prompt)
+            response = get_bot_response(
+                prompt,
+                history=history_for_prompt,
+                session_id=st.session_state.active_session_id,
+            )
         st.markdown(response["answer"])
         with st.expander("View retrieved context", expanded=False):
             st.text(response["context"])

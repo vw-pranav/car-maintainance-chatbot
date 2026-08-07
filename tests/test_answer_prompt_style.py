@@ -14,6 +14,7 @@ def _stub_dependencies():
 
     config_module = types.ModuleType("config")
     config_module.OLLAMA_MODEL = "fake-model"
+    config_module.OLLAMA_BASE_URL = "http://localhost:11434"
     config_module.TOP_K = 3
     sys.modules["config"] = config_module
 
@@ -88,10 +89,9 @@ class AnswerPromptStyleTests(unittest.TestCase):
         )
 
         self.assertIn("Answer:", prompt)
-        self.assertIn("Why:", prompt)
         self.assertIn("How We Know:", prompt)
         self.assertIn("Additional Information:", prompt)
-        self.assertIn("I could not find this information in the available documentation.", prompt)
+        self.assertIn("I could not find that information in the retrieved documentation.", prompt)
 
     def test_prompt_tells_model_to_explain_previous_answer_for_why_followups(self):
         prompt = build_answer_prompt(

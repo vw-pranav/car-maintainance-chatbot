@@ -1,5 +1,6 @@
 # Ollama Model
 OLLAMA_MODEL = "gemma-local:latest"
+OLLAMA_BASE_URL = "http://localhost:11434"
 
 # Embedding Model
 EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"

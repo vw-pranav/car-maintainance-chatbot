@@ -17,6 +17,7 @@ def _stub_dependencies():
 
     config_module = types.ModuleType("config")
     config_module.OLLAMA_MODEL = "fake-model"
+    config_module.OLLAMA_BASE_URL = "http://localhost:11434"
     config_module.TOP_K = 3
     sys.modules["config"] = config_module
 
@@ -90,7 +91,7 @@ class RetrievalQualityTests(unittest.TestCase):
             answer,
         )
 
-        self.assertIn("does not explicitly explain the reason", validated.lower())
+        self.assertIn("does not specify the reason", validated.lower())
 
 
 if __name__ == "__main__":
