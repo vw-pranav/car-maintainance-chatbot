@@ -70,6 +70,14 @@ class ChatApiTests(unittest.TestCase):
         self.assertGreaterEqual(len(payload["items"]), 1)
         self.assertIn("title", payload["items"][0])
 
+    def test_create_history_session_returns_unique_ids(self):
+        first_response = self.client.post("/api/history/session")
+        second_response = self.client.post("/api/history/session")
+
+        self.assertEqual(first_response.status_code, 200)
+        self.assertEqual(second_response.status_code, 200)
+        self.assertNotEqual(first_response.json()["id"], second_response.json()["id"])
+
     def test_delete_history_session(self):
         fake_payload = {
             "question": "Delete this session",

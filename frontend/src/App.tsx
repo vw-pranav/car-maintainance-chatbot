@@ -10,6 +10,7 @@ import {
 
 import {
   deleteHistorySession,
+  createHistorySession,
   fetchDocuments,
   fetchHistory,
   fetchHistorySessionMessages,
@@ -170,10 +171,22 @@ function App() {
   };
 
   const handleNewChat = () => {
-    setActiveSessionId(undefined);
-    setMessages([makeMessage('assistant', assistantWelcomeText)]);
-    setError('');
-    setInputValue('');
+    const startNewConversation = async () => {
+      setError('');
+      try {
+        const session = await createHistorySession();
+        setActiveSessionId(session.id);
+        setMessages([makeMessage('assistant', assistantWelcomeText)]);
+        await refreshSidebarData();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unable to start a new chat.';
+        setError(message);
+      } finally {
+        setInputValue('');
+      }
+    };
+
+    void startNewConversation();
   };
 
   const handleUploadClick = () => {

@@ -60,6 +60,13 @@ export interface HistorySessionResponse {
   }>;
 }
 
+export interface SessionCreateResponse {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
 async function parseError(response: Response): Promise<never> {
   const text = await response.text();
   try {
@@ -136,6 +143,18 @@ export async function deleteHistorySession(sessionId: number): Promise<void> {
 
 export async function fetchHistorySessionMessages(sessionId: number): Promise<HistorySessionResponse> {
   const response = await fetch(`${API_BASE_URL}/api/history/${sessionId}/messages`);
+  if (!response.ok) {
+    return parseError(response);
+  }
+
+  return response.json();
+}
+
+export async function createHistorySession(title = 'New conversation'): Promise<SessionCreateResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/history/session?title=${encodeURIComponent(title)}`, {
+    method: 'POST',
+  });
+
   if (!response.ok) {
     return parseError(response);
   }

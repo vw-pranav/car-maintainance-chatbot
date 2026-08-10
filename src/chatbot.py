@@ -358,6 +358,108 @@ def is_reasoning_question(question):
     return any(marker in q for marker in reasoning_markers)
 
 
+def is_equipment_question(question, history=None):
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    direct_markers = [
+        "equipment",
+        "tool",
+        "tools",
+        "special tool",
+        "workshop equipment",
+    ]
+    requirement_markers = ["required", "require", "needed", "need"]
+
+    if any(marker in q for marker in direct_markers):
+        return True
+
+    # Short follow-ups should inherit intent from previous tool/equipment answers.
+    if history and len(q.split()) <= 6 and any(marker in q for marker in ["what", "which", "list"]):
+        history_text = " ".join((turn.get("content") or "") for turn in history[-4:]).lower()
+        if any(marker in history_text for marker in direct_markers):
+            return True
+
+    return any(marker in q for marker in requirement_markers) and any(marker in q for marker in ["equipment", "tools"])
+
+
+def _clean_equipment_line(line):
+    cleaned = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", (line or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" :-")
+
+
+def extract_equipment_from_context(context, max_items=12):
+    if not context:
+        return []
+
+    id_pattern = re.compile(r"\b(?:VAS|VAG)\s*[-: ]?\d{2,6}[A-Z0-9-]*\b|\bT\d{3,6}[A-Z0-9-]*\b", re.IGNORECASE)
+    keyword_pattern = re.compile(
+        r"\b(special tool|workshop equipment|engine support|engine crane|hoist|lifting|adapter|fixture|mount|holder|puller|wrench|socket|tester|diagnostic tester)\b",
+        re.IGNORECASE,
+    )
+
+    generic_phrases = {
+        "special tools and workshop equipment",
+        "special tools and workshop equipment required",
+        "special tools required",
+        "workshop equipment required",
+    }
+
+    items = []
+    seen = set()
+
+    for raw_line in context.splitlines():
+        line = _clean_equipment_line(raw_line)
+        if not line:
+            continue
+        if line.lower().startswith("retrieved evidence"):
+            continue
+        if len(line) < 8:
+            continue
+
+        lower = line.lower()
+        if lower in generic_phrases:
+            continue
+
+        if not (id_pattern.search(line) or keyword_pattern.search(line)):
+            continue
+
+        normalized = lower
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(line)
+
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+def build_equipment_answer(question, context, history=None):
+    if not is_equipment_question(question, history=history):
+        return None
+
+    equipment_items = extract_equipment_from_context(context)
+    if not equipment_items:
+        return None
+
+    bullets = "\n".join([f"- {item}" for item in equipment_items])
+    return (
+        "Answer:\n"
+        "The documentation lists the following required equipment:\n"
+        f"{bullets}\n\n"
+        "Why:\n"
+        "These items are explicitly listed in the retrieved service documentation as required tools/equipment for this procedure.\n\n"
+        "How We Know:\n"
+        "The retrieved evidence includes named tools/workshop equipment entries, which were extracted directly from those sections.\n\n"
+        "Additional Information:\n"
+        "If you want, I can also group this into mandatory vs optional equipment when that distinction appears in the document."
+    )
+
+
 def _extract_reason_from_context(context):
     if not context:
         return None
@@ -441,6 +543,8 @@ CONVERSATION HISTORY
 For reasoning questions such as why, explain the documented reason only when the context explicitly states one.
 Do not treat warnings, cautions, safety notices, tool requirements, or injury notices as the reason for a procedure unless the documentation explicitly says so.
 If the retrieved documentation describes the procedure but does not explicitly state the reason, say that clearly.
+Do not collapse the answer into a generic stock sentence like 'The information indicates that it should not be reused.'
+If the context only supports the negative conclusion, still explain what the document does say and then state that the reason is not explicitly documented.
 Use this exact structure:
 Answer:
 <direct answer>
@@ -456,6 +560,14 @@ Possible Explanation (Inference):
 
 Additional Information:
 <optional>
+"""
+
+    equipment_instruction = ""
+    if is_equipment_question(question, history=history):
+        equipment_instruction = """
+For equipment/tool questions, do not answer generically.
+List the exact equipment names and tool IDs exactly as they appear in the Context.
+If no specific equipment names are present, explicitly state that the Context does not list specific equipment names.
 """
 
     return f"""
@@ -505,6 +617,7 @@ Style rules:
 - Add a brief bit of context or explanation when useful, as a real assistant would.
 - {explanation_guidance}
 - {reasoning_instruction}
+- {equipment_instruction}
 - When appropriate, include a short follow-up phrase such as "If you want, I can also help with..." or "For this task, the key point is...".
 - Organize the answer clearly with headings when useful, such as Summary, Steps, Warnings, Required tools, or Final checks.
 - Add light explanation where it helps, but do not add unsupported details.
@@ -565,6 +678,7 @@ Rules:
 - Give a slightly fuller answer than a one-line response when the Context supports it, so the reply feels helpful and complete.
 - Use the chat memory to understand follow-up questions and keep the answer tied to the earlier topic.
 - For a follow-up such as 'why', explain the earlier answer, not a new unrelated topic.
+- For reasoning questions, keep the Why section and explain what the documentation says or does not say; do not collapse it into a generic one-line refusal.
 - {explanation_guidance}
 - Keep the final answer in this structure:
   Answer:
@@ -617,6 +731,7 @@ Rules:
 - Include a brief explanation or context if it helps the response feel complete.
 - Use the chat memory to understand follow-up questions and keep the answer tied to the earlier topic.
 - For a follow-up such as 'why', explain the earlier answer, not a new unrelated topic.
+- For reasoning questions, preserve the explanation structure and do not reduce the answer to a single stock sentence.
 - {explanation_guidance}
 - Preserve the structure below in the rewritten answer:
   Answer:
@@ -654,6 +769,9 @@ REWRITTEN ANSWER
 
 
 def enforce_grounding_for_negation(question, context, answer):
+    if is_reasoning_question(question):
+        return re.sub(r"\s+", " ", answer or "").strip()
+
     question_lower = (question or "").lower()
     context_lower = (context or "").lower()
     answer_lower = (answer or "").lower()
@@ -743,6 +861,21 @@ def ask_question(question, history=None, session_id=None):
 
     context = format_context_for_generation(cleaned_chunks)
 
+    equipment_answer = build_equipment_answer(question, context, history=history)
+    if equipment_answer:
+        final_answer = equipment_answer
+
+        if session_id:
+            memory = ThreadedConversationMemory(session_id=session_id)
+            memory.add_user_message(question)
+            memory.add_ai_message(final_answer)
+
+        return {
+            "question": question,
+            "answer": final_answer,
+            "context": context,
+        }
+
     answer_prompt = build_answer_prompt(question, context, history=history)
     draft_response = llm.invoke(answer_prompt)
     draft_answer = draft_response.content.strip()
@@ -754,9 +887,12 @@ def ask_question(question, history=None, session_id=None):
     verified_response = llm.invoke(verification_prompt)
     verified_answer = verified_response.content.strip()
 
-    rewrite_prompt = build_rewrite_prompt(question, context, verified_answer, history=history)
-    rewritten_response = llm.invoke(rewrite_prompt)
-    final_answer = rewritten_response.content.strip()
+    if is_reasoning_question(question):
+        final_answer = verified_answer
+    else:
+        rewrite_prompt = build_rewrite_prompt(question, context, verified_answer, history=history)
+        rewritten_response = llm.invoke(rewrite_prompt)
+        final_answer = rewritten_response.content.strip()
     final_answer = enforce_grounding_for_negation(question, context, final_answer)
 
     if session_id:
