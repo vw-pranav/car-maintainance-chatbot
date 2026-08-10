@@ -65,7 +65,42 @@ class SparseRetriever:
             return ""
 
         tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
-        return " ".join(tokens)
+        stop_words = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "that",
+            "this",
+            "what",
+            "when",
+            "why",
+            "how",
+            "can",
+            "you",
+            "your",
+            "about",
+            "is",
+            "it",
+            "be",
+            "of",
+            "to",
+            "a",
+            "an",
+            "are",
+            "was",
+            "were",
+            "does",
+            "do",
+            "did",
+            "into",
+            "on",
+            "in",
+            "as",
+        }
+        filtered = [token for token in tokens if token not in stop_words and len(token) >= 3]
+        return " ".join(filtered)
 
     def _build_match_query(self, query: str) -> str:
         normalized_query = self._normalize_query(query)

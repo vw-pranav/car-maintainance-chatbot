@@ -48,9 +48,13 @@ node_modules/
 .streamlit/secrets.toml
 
 data/raw/
+<<<<<<< HEAD
+garagegpt_history.db
+=======
 
 
 
 garagegpt_history.db
  
  
+>>>>>>> origin/feature/output-improvements
