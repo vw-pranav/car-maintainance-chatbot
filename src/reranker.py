@@ -26,6 +26,22 @@ def _metadata_boost(doc):
     return boost
 
 
+def _is_table_intent(question: str) -> bool:
+    q = (question or "").lower()
+    markers = [
+        "table",
+        "tools",
+        "equipment",
+        "specification",
+        "torque",
+        "part number",
+        "diagnostic path",
+        "control module",
+        "menu path",
+    ]
+    return any(marker in q for marker in markers)
+
+
 def rerank(question, docs, top_k=8):
     pairs = []
     for doc in docs:
@@ -40,6 +56,9 @@ def rerank(question, docs, top_k=8):
     ranked = []
     for score, doc in zip(scores, docs):
         metadata_boost = _metadata_boost(doc)
+        metadata = getattr(doc, "metadata", {}) or {}
+        if metadata.get("doc_type") == "table" and _is_table_intent(question):
+            metadata_boost += 2.2
         content = (doc.page_content or "").lower()
         if any(term in content for term in ["coolant", "fuel injection", "ignition", "compressor"]):
             metadata_boost -= 1.0

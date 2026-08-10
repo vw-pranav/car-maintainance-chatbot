@@ -12,6 +12,7 @@ transformers==5.14.0
 torch==2.13.0
 
 pypdf==6.14.2
+pdfplumber==0.11.7
 pandas==3.0.3
 openpyxl
 numpy==2.5.1

@@ -42,8 +42,14 @@ def _clean_page_text(text: str) -> str:
 
 def split_documents(documents):
     cleaned_documents = []
+    table_documents = []
 
     for document in documents:
+        metadata = document.metadata or {}
+        if metadata.get("doc_type") == "table":
+            table_documents.append(document)
+            continue
+
         cleaned_text = _clean_page_text(document.page_content)
         if not cleaned_text:
             continue
@@ -57,5 +63,8 @@ def split_documents(documents):
     )
 
     chunks = text_splitter.split_documents(cleaned_documents)
+
+    # Keep table chunks intact so row-column relationships survive retrieval.
+    chunks.extend(table_documents)
 
     return chunks

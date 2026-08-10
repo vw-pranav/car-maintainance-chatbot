@@ -2,7 +2,7 @@ import logging
 import os
 import re
 import sys
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import httpx
 
@@ -17,6 +17,83 @@ except ModuleNotFoundError:
 
 
 logger = logging.getLogger(__name__)
+
+
+TABLE_INTENT_MARKERS = [
+    "table",
+    "equipment",
+    "tool",
+    "tools",
+    "required",
+    "specification",
+    "specifications",
+    "torque",
+    "part number",
+    "part no",
+    "diagnostic path",
+    "menu path",
+    "control module",
+]
+
+
+def _is_table_doc(metadata: Dict[str, Any] | None) -> bool:
+    if not metadata:
+        return False
+    return str(metadata.get("doc_type", "")).lower() == "table"
+
+
+def _is_table_intent(question: str) -> bool:
+    q = (question or "").lower()
+    return any(marker in q for marker in TABLE_INTENT_MARKERS)
+
+
+def _looks_like_table_line(line: str) -> bool:
+    lowered = (line or "").strip().lower()
+    if not lowered:
+        return False
+    return (
+        lowered.startswith("table headers:")
+        or lowered.startswith("table row:")
+        or lowered.startswith("table source:")
+        or " | " in lowered
+        or lowered.count("=") >= 2 and ";" in lowered
+    )
+
+
+def _extract_table_headers(context: str) -> List[str]:
+    for line in (context or "").splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("table headers:"):
+            payload = stripped.split(":", 1)[1]
+            headers = [item.strip() for item in payload.split("|") if item.strip()]
+            return headers
+    return []
+
+
+def _extract_table_rows(context: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for line in (context or "").splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("table row:"):
+            continue
+        payload = stripped.split(":", 1)[1]
+        row: Dict[str, str] = {}
+        for pair in payload.split(";"):
+            if "=" not in pair:
+                continue
+            key, value = pair.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                row[key] = value
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _header_matches(header: str, markers: List[str]) -> bool:
+    lowered = (header or "").lower()
+    return any(marker in lowered for marker in markers)
 
 
 def _normalize_ollama_url(raw_url: str) -> str:
@@ -143,7 +220,10 @@ _startup_fail_fast_check()
 # ---------------------------------------------------
 # Clean Retrieved Context
 # ---------------------------------------------------
-def clean_context(text):
+def clean_context(text, metadata: Dict[str, Any] | None = None):
+
+    if _is_table_doc(metadata):
+        return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
     unwanted = [
         "copyright",
@@ -172,6 +252,8 @@ def clean_context(text):
             continue
 
         if any(word in lower for word in unwanted):
+            if _looks_like_table_line(stripped):
+                cleaned_lines.append(stripped)
             continue
 
         if lower.startswith(("♦", "⇒", "refer to")):
@@ -182,6 +264,8 @@ def clean_context(text):
                 continue
 
         if len(lower) < 5:
+            if _looks_like_table_line(stripped):
+                cleaned_lines.append(stripped)
             continue
 
         cleaned_lines.append(stripped)
@@ -215,6 +299,23 @@ def remove_duplicates(chunks):
         if key not in seen:
             seen.add(key)
             unique.append(chunk)
+
+    return unique
+
+
+def remove_duplicate_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    unique: List[Dict[str, Any]] = []
+
+    for entry in entries:
+        text = (entry.get("text") or "").strip()
+        if not text:
+            continue
+        key = text[:300]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
 
     return unique
 
@@ -431,8 +532,156 @@ def extract_specification_list(context: str) -> List[str]:
     return seen
 
 
+def _extract_tool_values_from_table(rows: List[Dict[str, str]]) -> List[str]:
+    tools: List[str] = []
+    for row in rows:
+        name_value = ""
+        part_value = ""
+        for key, value in row.items():
+            if _header_matches(key, ["tool", "equipment", "item", "name", "description"]) and value:
+                name_value = value
+            if _header_matches(key, ["part", "number", "no", "vas", "vag"]) and value:
+                part_value = value
+
+        if not name_value and not part_value:
+            for value in row.values():
+                lowered = (value or "").lower()
+                if any(marker in lowered for marker in ["vas", "vag", "adapter", "support", "tool"]):
+                    name_value = value
+                    break
+
+        if name_value and part_value and part_value not in name_value:
+            candidate = f"{name_value} ({part_value})"
+        else:
+            candidate = name_value or part_value
+
+        candidate = (candidate or "").strip()
+        if candidate and candidate not in tools:
+            tools.append(candidate)
+
+    return tools
+
+
+def _extract_spec_rows_from_table(rows: List[Dict[str, str]]) -> List[str]:
+    specs: List[str] = []
+    for row in rows:
+        row_items = []
+        for key, value in row.items():
+            cleaned_value = (value or "").strip()
+            if not cleaned_value:
+                continue
+            if _header_matches(key, ["spec", "torque", "value", "limit", "range", "unit"]) or re.search(
+                r"\b\d+(?:[.,]\d+)?\s*(?:Nm|N\s*m|mm|cm|ml|l|bar|psi|V|A|°C|C)\b",
+                cleaned_value,
+                re.IGNORECASE,
+            ):
+                row_items.append(f"{key}: {cleaned_value}")
+        if row_items:
+            merged = " ; ".join(row_items)
+            if merged not in specs:
+                specs.append(merged)
+
+    return specs
+
+
+def _extract_part_numbers_from_table(rows: List[Dict[str, str]]) -> List[str]:
+    values: List[str] = []
+    regex = re.compile(r"\b[A-Z0-9][A-Z0-9./-]{4,}\b")
+    for row in rows:
+        for key, value in row.items():
+            cleaned_value = (value or "").strip()
+            if not cleaned_value:
+                continue
+            if _header_matches(key, ["part", "number", "part no", "item no", "pn"]):
+                if cleaned_value not in values:
+                    values.append(cleaned_value)
+                continue
+            for match in regex.findall(cleaned_value):
+                if match not in values:
+                    values.append(match)
+    return values
+
+
+def _extract_diagnostic_path_from_table(rows: List[Dict[str, str]]) -> List[str]:
+    path: List[str] = []
+    for row in rows:
+        local_values: List[str] = []
+        for key, value in row.items():
+            cleaned_value = (value or "").strip()
+            if not cleaned_value:
+                continue
+            if _header_matches(key, ["path", "menu", "step", "system", "module", "function", "selection"]):
+                local_values.append(cleaned_value)
+
+        if not local_values:
+            for value in row.values():
+                cleaned_value = (value or "").strip()
+                lowered = cleaned_value.lower()
+                if any(marker in lowered for marker in ["engine electronics", "diagnostic", "bleeding", "control unit"]):
+                    local_values.append(cleaned_value)
+
+        for value in local_values:
+            if value not in path:
+                path.append(value)
+
+    return path
+
+
+def build_table_structured_answer(question: str, context: str) -> str | None:
+    rows = _extract_table_rows(context)
+    if not rows:
+        return None
+
+    question_lower = (question or "").lower()
+
+    if any(term in question_lower for term in ["equipment", "tool", "tools", "required"]):
+        tools = _extract_tool_values_from_table(rows)
+        if tools:
+            answer_lines = ["Required Equipment:"]
+            answer_lines.extend([f"• {item}" for item in tools])
+            return _build_structured_response(
+                "\n".join(answer_lines),
+                "The answer is taken directly from table rows and headers in the retrieved documentation.",
+            )
+
+    if any(term in question_lower for term in ["torque", "specification", "specifications", "value", "limit"]):
+        specifications = _extract_spec_rows_from_table(rows)
+        if specifications:
+            answer_lines = ["Specifications:"]
+            answer_lines.extend([f"• {item}" for item in specifications])
+            return _build_structured_response(
+                "\n".join(answer_lines),
+                "The answer is taken directly from table rows and headers in the retrieved documentation.",
+            )
+
+    if any(term in question_lower for term in ["part number", "part no", "item number", "pn"]):
+        part_numbers = _extract_part_numbers_from_table(rows)
+        if part_numbers:
+            answer_lines = ["Part Numbers:"]
+            answer_lines.extend([f"• {item}" for item in part_numbers])
+            return _build_structured_response(
+                "\n".join(answer_lines),
+                "The answer is taken directly from table rows and headers in the retrieved documentation.",
+            )
+
+    if any(term in question_lower for term in ["diagnostic", "menu", "control unit", "path", "module"]):
+        path = _extract_diagnostic_path_from_table(rows)
+        if path:
+            answer_lines = ["Diagnostic Path:"]
+            answer_lines.extend([f"• {item}" for item in path])
+            return _build_structured_response(
+                "\n".join(answer_lines),
+                "The answer is taken directly from table rows and headers in the retrieved documentation.",
+            )
+
+    return None
+
+
 def extract_structured_evidence(question: str, context: str) -> Dict[str, object]:
     """Extract high-signal evidence that should survive LLM generation."""
+    table_answer = build_table_structured_answer(question, context)
+    table_headers = _extract_table_headers(context)
+    table_rows = _extract_table_rows(context)
     yes_no = extract_yes_no_answer(question, context)
     diagnostic_path = extract_diagnostic_path(question, context)
     tool_list = extract_tool_list(question, context)
@@ -451,7 +700,7 @@ def extract_structured_evidence(question: str, context: str) -> Dict[str, object
     part_numbers = sorted(set(re.findall(r"\b(?:part|item)?\s*(?:no\.?|number)\s*[A-Z0-9][A-Z0-9./-]*\b", context, re.IGNORECASE)))
     specifications = extract_specification_list(context)
 
-    direct = bool(yes_no or diagnostic_path or tool_list or direct_answer_sentences)
+    direct = bool(table_answer or yes_no or diagnostic_path or tool_list or direct_answer_sentences)
     overlap = _question_tokens(question).intersection(
         set(re.findall(r"[a-z0-9]+", (context or "").lower()))
     )
@@ -470,6 +719,9 @@ def extract_structured_evidence(question: str, context: str) -> Dict[str, object
     return {
         "confidence": confidence,
         "evidence_type": evidence_type,
+        "table_answer": table_answer,
+        "table_headers": table_headers,
+        "table_rows": table_rows,
         "yes_no": yes_no,
         "diagnostic_path": diagnostic_path,
         "direct_answer_sentences": direct_answer_sentences,
@@ -483,6 +735,10 @@ def extract_structured_evidence(question: str, context: str) -> Dict[str, object
 
 def build_extracted_answer(question: str, context: str, evidence: Dict[str, object]) -> str | None:
     """Build a minimal grounded answer for explicit evidence."""
+    table_answer = evidence.get("table_answer")
+    if isinstance(table_answer, str) and table_answer.strip():
+        return table_answer
+
     yes_no = evidence.get("yes_no")
     if isinstance(yes_no, dict):
         evidence_line = yes_no["evidence"]
@@ -704,12 +960,18 @@ def score_chunk_relevance(question, doc):
     if isinstance(section_hints, str):
         section_hints = [section_hints]
     section_text = " ".join([str(item) for item in section_hints if item])
+    is_table = _is_table_doc(metadata)
 
     question_lower = (question or "").lower()
     content_lower = content.lower()
     section_lower = section_text.lower()
 
     score = 0.0
+
+    if is_table:
+        score += 1.5
+        if _is_table_intent(question):
+            score += 4.0
 
     if "engine" in question_lower:
         if "engine" in content_lower:
@@ -724,6 +986,10 @@ def score_chunk_relevance(question, doc):
     if "remov" in question_lower or "remove" in question_lower:
         if "remov" in content_lower or "remove" in content_lower:
             score += 2.0
+
+    if _is_table_intent(question):
+        if any(marker in content_lower for marker in ["table row:", "table headers:", "torque", "part", "vas", "required equipment"]):
+            score += 2.5
 
     if any(term in content_lower for term in ["coolant", "fuel injection", "ignition", "compressor", "electrical compressor"]):
         score -= 5.0
@@ -921,7 +1187,10 @@ Conversation rules:
 Grounding rules:
 - Use the retrieved documentation as the primary source of truth.
 - Answer only from the provided Context.
+- If Context contains table evidence, use table rows and headers as the primary source over paragraph text.
+- Preserve row-column relationships and header meanings from table evidence.
 - Never invent information that is not supported by the retrieved documentation.
+- Never invent missing table values; if a value is absent, do not fabricate it.
 - Do not convert warnings into reasons.
 - Do not convert procedures into explanations.
 - Do not assume engineering intent unless it is explicitly stated.
@@ -958,6 +1227,7 @@ Formatting rules:
 - Do not repeat the same sentence in Answer and How We Know. Paraphrase the answer and use the evidence bullets to support it.
 - Include only related information that helps answer the question; omit unrelated retrieved instructions.
 - For equipment, tools, specifications, torque values, part numbers, menu paths, or control modules, return a structured list.
+- For table-derived answers, keep values in structured key-value or list form and do not flatten them into free text.
 - For why questions without a documented reason, use:
     Answer:
     The documentation does not specify the reason.
@@ -1001,6 +1271,8 @@ Rules:
 - Keep the answer conversational, helpful, and concise.
 - Answer the user's question directly first.
 - Preserve explicit negatives such as cannot be reused, must not be reused, or do not use.
+- If table evidence exists, prefer table values over paragraph text and preserve row-column/header relationships.
+- Never invent missing table values.
 - Do not convert warnings into reasons.
 - Do not convert procedures into explanations.
 - If the documentation does not explicitly state a reason, say exactly:
@@ -1061,7 +1333,9 @@ Rules:
 - Answer directly first.
 - Do not copy large source phrases verbatim.
 - Stay strictly grounded in the Context.
+- If table evidence exists, keep table-derived values in structured form and preserve header-to-value relationships.
 - Do not add unsupported reasons, explanations, steps, or engineering intent.
+- Never invent missing table values.
 - For a follow-up such as why, stay tied to the earlier topic.
 - Use TOP EVIDENCE first.
 - Do not answer from lower-ranked evidence when TOP EVIDENCE already answers the question.
@@ -1149,7 +1423,8 @@ def ask_question(question, history=None, session_id=None):
 
     relevant_docs = []
     for doc in docs:
-        cleaned_doc = clean_context(doc.page_content)
+        metadata = getattr(doc, "metadata", {}) or {}
+        cleaned_doc = clean_context(doc.page_content, metadata=metadata)
         relevance_score = score_chunk_relevance(retrieval_query, doc)
         evidence = extract_structured_evidence(question, cleaned_doc)
         if relevance_score >= 6.0 or evidence["confidence"] in {"HIGH", "MEDIUM"}:
@@ -1162,7 +1437,8 @@ def ask_question(question, history=None, session_id=None):
             alt_docs = rerank(secondary_query, alt_docs, top_k=TOP_K)
             relevant_docs = []
             for doc in alt_docs:
-                cleaned_doc = clean_context(doc.page_content)
+                metadata = getattr(doc, "metadata", {}) or {}
+                cleaned_doc = clean_context(doc.page_content, metadata=metadata)
                 relevance_score = score_chunk_relevance(secondary_query, doc)
                 evidence = extract_structured_evidence(question, cleaned_doc)
                 if relevance_score >= 6.0 or evidence["confidence"] in {"HIGH", "MEDIUM"}:
@@ -1178,23 +1454,32 @@ def ask_question(question, history=None, session_id=None):
             "context": "",
         }
 
-    cleaned_chunks = []
+    cleaned_entries = []
 
     for i, doc in enumerate(relevant_docs, start=1):
 
-        cleaned = clean_context(doc.page_content)
+        metadata = getattr(doc, "metadata", {}) or {}
+        cleaned = clean_context(doc.page_content, metadata=metadata)
 
         if cleaned.strip():
-            cleaned_chunks.append(cleaned)
+            cleaned_entries.append({"text": cleaned, "metadata": metadata})
 
             print(f"\n----------- Chunk {i} -----------\n")
             print(cleaned[:1200])
 
-    cleaned_chunks = remove_duplicates(cleaned_chunks)
+    cleaned_entries = remove_duplicate_entries(cleaned_entries)
+    cleaned_chunks = [entry["text"] for entry in cleaned_entries]
 
     context = format_context_for_generation(cleaned_chunks)
     top_chunk = cleaned_chunks[0] if cleaned_chunks else ""
-    secondary_chunks = cleaned_chunks[1:]
+
+    if _is_table_intent(question):
+        for entry in cleaned_entries:
+            if _is_table_doc(entry.get("metadata") or {}):
+                top_chunk = entry.get("text") or top_chunk
+                break
+
+    secondary_chunks = [chunk for chunk in cleaned_chunks if chunk != top_chunk]
     secondary_evidence_text = "\n\n".join(secondary_chunks)
     top_evidence = extract_structured_evidence(question, top_chunk)
     evidence = extract_structured_evidence(question, context)

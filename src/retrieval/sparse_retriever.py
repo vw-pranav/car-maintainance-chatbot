@@ -2,6 +2,7 @@ import re
 import sqlite3
 from pathlib import Path
 from typing import List
+import json
 
 from langchain_core.documents import Document
 
@@ -39,8 +40,21 @@ class SparseRetriever:
         finally:
             conn.close()
 
-    def _ensure_index(self):
+    def _has_metadata_columns(self) -> bool:
         if not self._has_docs_table():
+            return False
+
+        conn = self._connect()
+        try:
+            cursor = conn.execute("PRAGMA table_info(docs)")
+            columns = {row[1] for row in cursor.fetchall()}
+            required = {"doc_type", "source", "page", "metadata"}
+            return required.issubset(columns)
+        finally:
+            conn.close()
+
+    def _ensure_index(self):
+        if not self._has_docs_table() or not self._has_metadata_columns():
             documents = load_pdfs(PDF_DIRECTORY)
             chunks = split_documents(documents)
             create_sparse_index(chunks, self.db_path)
@@ -71,7 +85,7 @@ class SparseRetriever:
             return []
 
         sql = """
-            SELECT doc_id, bm25(docs) AS score, text
+            SELECT doc_id, bm25(docs) AS score, text, doc_type, source, page, metadata
             FROM docs
             WHERE docs MATCH ?
             ORDER BY score
@@ -86,8 +100,26 @@ class SparseRetriever:
             conn.close()
 
         documents = []
-        for doc_id, score, text in rows:
-            documents.append(Document(page_content=text, metadata={"doc_id": doc_id, "score": score}))
+        for doc_id, score, text, doc_type, source, page, metadata_json in rows:
+            parsed_metadata = {}
+            if metadata_json:
+                try:
+                    parsed_metadata = json.loads(metadata_json)
+                except json.JSONDecodeError:
+                    parsed_metadata = {}
+
+            merged_metadata = {
+                **parsed_metadata,
+                "doc_id": doc_id,
+                "score": score,
+                "doc_type": doc_type or parsed_metadata.get("doc_type", "text"),
+            }
+            if source:
+                merged_metadata["source"] = source
+            if page is not None:
+                merged_metadata["page"] = page
+
+            documents.append(Document(page_content=text, metadata=merged_metadata))
 
         return documents
 
@@ -98,9 +130,29 @@ def create_sparse_index(documents: List[Document], db_path: Path = SQL_FILE):
 
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("CREATE VIRTUAL TABLE docs USING fts5(doc_id UNINDEXED, text, score UNINDEXED)")
+    conn.execute(
+        "CREATE VIRTUAL TABLE docs USING fts5("
+        "doc_id UNINDEXED, text, score UNINDEXED, doc_type UNINDEXED, source UNINDEXED, page UNINDEXED, metadata UNINDEXED)"
+    )
 
-    rows = [(str(i), doc.page_content, 0) for i, doc in enumerate(documents)]
-    conn.executemany("INSERT INTO docs(doc_id, text, score) VALUES (?, ?, ?)", rows)
+    rows = []
+    for i, doc in enumerate(documents):
+        metadata = getattr(doc, "metadata", {}) or {}
+        rows.append(
+            (
+                str(i),
+                doc.page_content,
+                0,
+                str(metadata.get("doc_type", "text")),
+                str(metadata.get("source", "")),
+                metadata.get("page"),
+                json.dumps(metadata, ensure_ascii=True, default=str),
+            )
+        )
+
+    conn.executemany(
+        "INSERT INTO docs(doc_id, text, score, doc_type, source, page, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
     conn.commit()
     conn.close()

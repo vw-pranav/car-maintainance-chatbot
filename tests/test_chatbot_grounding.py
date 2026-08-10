@@ -175,6 +175,58 @@ class ChatbotGroundingTests(unittest.TestCase):
 
         self.assertEqual(confidence, "HIGH")
 
+    def test_table_torque_answer_is_structured_and_grounded(self):
+        question = "What is the torque specification for the mounting bolts?"
+        table_context = (
+            "TABLE SOURCE: enginepdf2.pdf PAGE 120 TABLE 1\n"
+            "TABLE HEADERS: component | torque specification\n"
+            "TABLE ROW: component=mounting bolts ; torque specification=50 Nm"
+        )
+
+        evidence = extract_structured_evidence(question, table_context)
+        answer = build_extracted_answer(question, table_context, evidence)
+
+        self.assertEqual(evidence["confidence"], "HIGH")
+        self.assertIsNotNone(answer)
+        self.assertIn("Specifications:", answer)
+        self.assertIn("torque specification: 50 Nm", answer)
+
+    def test_table_tools_override_conflicting_paragraph_text(self):
+        question = "What equipment is required?"
+        mixed_context = (
+            "A generic statement says no special tools are required.\n"
+            "TABLE SOURCE: enginepdf2.pdf PAGE 130 TABLE 2\n"
+            "TABLE HEADERS: tool name | part number\n"
+            "TABLE ROW: tool name=Scissor Lift Table - VAS6131B- ; part number=VAS6131B-\n"
+            "TABLE ROW: tool name=Universal Supports - VAS6131/13- ; part number=VAS6131/13-"
+        )
+
+        evidence = extract_structured_evidence(question, mixed_context)
+        answer = build_extracted_answer(question, mixed_context, evidence)
+
+        self.assertEqual(evidence["confidence"], "HIGH")
+        self.assertIn("Required Equipment:", answer)
+        self.assertIn("Scissor Lift Table - VAS6131B-", answer)
+        self.assertIn("Universal Supports - VAS6131/13-", answer)
+        self.assertNotIn("no special tools are required", answer.lower())
+
+    def test_table_part_numbers_return_as_list(self):
+        question = "What are the part numbers?"
+        table_context = (
+            "TABLE SOURCE: fuel_ignition_engine.pdf PAGE 42 TABLE 1\n"
+            "TABLE HEADERS: item | part number\n"
+            "TABLE ROW: item=Coolant hose ; part number=8W0-121-101\n"
+            "TABLE ROW: item=Seal ; part number=06E-121-119"
+        )
+
+        evidence = extract_structured_evidence(question, table_context)
+        answer = build_extracted_answer(question, table_context, evidence)
+
+        self.assertEqual(evidence["confidence"], "HIGH")
+        self.assertIn("Part Numbers:", answer)
+        self.assertIn("8W0-121-101", answer)
+        self.assertIn("06E-121-119", answer)
+
 
 
 if __name__ == "__main__":
