@@ -1,0 +1,265 @@
+:root {
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #1f2937;
+  background: #f4f6fb;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+  background: #f4f6fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.app-shell {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.topbar {
+  width: 100%;
+  background: #042838;
+  color: #ffffff;
+}
+
+.topbar groupui-header {
+  display: flex;
+  align-items: center;
+  padding: 0.9rem 1.2rem;
+}
+
+.brand-logo {
+  height: 34px;
+  width: auto;
+  margin-right: 0.75rem;
+}
+
+.topbar groupui-headline {
+  color: #ffffff;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar {
+  background: #ffffff;
+  border-right: 1px solid #e5e7eb;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar > groupui-global-side-navigation {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar-actions {
+  margin-top: auto;
+  flex-shrink: 0;
+}
+
+.new-chat-button {
+  width: 100%;
+}
+
+.upload-button {
+  padding: 0.5rem 0 0;
+  display: flex;
+  justify-content: stretch;
+}
+
+.upload-button groupui-button {
+  width: 100%;
+}
+
+.sidebar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+}
+
+.sidebar-link {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+  width: 100%;
+}
+
+.sidebar-title {
+  font-size: 0.88rem;
+  line-height: 1.2;
+}
+
+.sidebar-time {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.72rem;
+  color: #6b7280;
+}
+
+.sidebar-delete {
+  border: none;
+  background: transparent;
+  color: #9ca3af;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0 0.2rem;
+}
+
+.sidebar-delete:hover {
+  color: #b91c1c;
+}
+
+.sidebar-doc-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 1.5rem;
+  gap: 1rem;
+  min-height: 0;
+}
+
+.message-list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 0.25rem;
+}
+
+.message-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.message-row.user {
+  justify-content: flex-end;
+}
+
+.message-row.loading-indicator {
+  justify-content: flex-start;
+  padding: 0.5rem 0;
+}
+
+.assistant-thinking-card {
+  background: #f8fafc;
+  border-color: #dbe7f0;
+}
+
+.assistant-thinking-text {
+  color: #62748a;
+  animation: thinkingPulse 1.25s ease-in-out infinite;
+}
+
+@keyframes thinkingPulse {
+  0% {
+    opacity: 0.5;
+  }
+
+  50% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0.5;
+  }
+}
+
+.g-card.message-card {
+  padding: 1rem;
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  max-width: 70%;
+  word-wrap: break-word;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.message-row.user .g-card.message-card {
+  background: #042838;
+  color: white;
+  border: 1px solid #042838;
+}
+
+.message-sender {
+  display: block;
+  font-size: 0.875rem;
+  margin-bottom: 0.25rem;
+  opacity: 0.7;
+}
+
+.message-row.user .message-sender {
+  opacity: 0.9;
+}
+
+.message-content {
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  margin-top: 0.25rem;
+}
+
+.message-timestamp {
+  margin-top: 0.5rem;
+  font-size: 0.72rem;
+  opacity: 0.75;
+}
+
+.composer {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-end;
+  flex-shrink: 0;
+  margin-top: auto;
+  padding-top: 1rem;
+  border-top: 1px solid #e5e7eb;
+}
+
+.composer groupui-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.composer groupui-button {
+  flex-shrink: 0;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid #e5e7eb;
+  }
+}

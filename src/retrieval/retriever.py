@@ -4,12 +4,16 @@ from retrieval.sparse_retriever import SparseRetriever
 from config import (
     CHROMA_DB_PATH,
     COLLECTION_NAME,
+    PDF_DIRECTORY,
     SEARCH_TYPE,
     RETRIEVAL_K,
     SPARSE_K,
     HYBRID_K,
     HYBRID_DENSE_WEIGHT,
 )
+from loaders.pdf_loader import load_pdfs
+from processing.text_splitter import split_documents
+from vectorestore.chroma_db import create_vector_db
 
 
 class HybridRetriever:
@@ -48,7 +52,12 @@ class HybridRetriever:
         return 1.0 / (1.0 + score) if score is not None else 0.0
 
     def invoke(self, query: str):
-        dense_results = self.dense_store.similarity_search_with_score(query, k=self.dense_k)
+        dense_results = []
+        try:
+            dense_results = self.dense_store.similarity_search_with_score(query, k=self.dense_k)
+        except Exception as exc:
+            # Keep chat available via sparse retrieval when dense store is temporarily unavailable.
+            print(f"Dense retrieval unavailable, falling back to sparse-only retrieval: {exc}")
         sparse_docs = self.sparse_retriever.search(query, k=self.sparse_k)
 
         normalized_dense_scores = self._normalize_dense_scores(dense_results)
@@ -97,11 +106,20 @@ def get_retriever():
 
     embedding_model = get_embedding_model()
 
-    db = Chroma(
-        persist_directory=CHROMA_DB_PATH,
-        embedding_function=embedding_model,
-        collection_name=COLLECTION_NAME,
-    )
+    try:
+        db = Chroma(
+            persist_directory=CHROMA_DB_PATH,
+            embedding_function=embedding_model,
+            collection_name=COLLECTION_NAME,
+        )
+
+        # Force a lightweight operation so schema/config issues surface early.
+        db.similarity_search("healthcheck", k=1)
+    except Exception as exc:
+        print(f"Chroma store unavailable or invalid, rebuilding index: {exc}")
+        documents = load_pdfs(PDF_DIRECTORY)
+        chunks = split_documents(documents)
+        db = create_vector_db(chunks)
 
     sparse_retriever = SparseRetriever()
 

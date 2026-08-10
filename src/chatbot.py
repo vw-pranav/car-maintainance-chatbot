@@ -229,8 +229,14 @@ def score_chunk_relevance(question, doc):
     question_lower = (question or "").lower()
     content_lower = content.lower()
     section_lower = section_text.lower()
+    question_tokens = set(_extract_keywords(question))
+    doc_tokens = set(re.findall(r"[a-z0-9]+", f"{content_lower} {section_lower}"))
 
     score = 0.0
+
+    # Generic lexical relevance so non-engine queries can still pass filtering.
+    overlap = len(question_tokens.intersection(doc_tokens))
+    score += overlap * 1.2
 
     if "engine" in question_lower:
         if "engine" in content_lower:
@@ -246,8 +252,22 @@ def score_chunk_relevance(question, doc):
         if "remov" in content_lower or "remove" in content_lower:
             score += 2.0
 
-    if any(term in content_lower for term in ["coolant", "fuel injection", "ignition", "compressor", "electrical compressor"]):
-        score -= 5.0
+    # Favor direct matches for common maintenance domains.
+    domain_terms = [
+        "coolant",
+        "mixture",
+        "antifreeze",
+        "oil",
+        "brake",
+        "transmission",
+        "engine",
+        "torque",
+        "service",
+        "inspection",
+    ]
+    for term in domain_terms:
+        if term in question_lower and (term in content_lower or term in section_lower):
+            score += 1.5
 
     if "engine" in content_lower and any(term in content_lower for term in ["transmission", "subframe", "assembly", "removal"]):
         score += 2.0
@@ -263,7 +283,7 @@ def is_context_relevant(question, docs):
     if not scores:
         return False
 
-    return max(scores) >= 6.0
+    return max(scores) >= 3.0
 
 
 def get_question_explanation_guidance(question, history=None):
@@ -316,18 +336,6 @@ CHAT MEMORY
 {joined}
 
 """
-
-
-def build_retrieval_query(question, history=None):
-    question_lower = (question or "").lower().strip()
-    if not history:
-        return question
-
-    followup_context = build_followup_context(history)
-    if followup_context:
-        return f"Conversation context:\n{followup_context}\nCurrent question: {question}"
-
-    return question
 
 
 def is_reasoning_question(question):
@@ -689,17 +697,27 @@ def ask_question(question, history=None, session_id=None):
 
     print("\n================ RETRIEVED CHUNKS ================\n")
 
-    relevant_docs = [doc for doc in docs if score_chunk_relevance(retrieval_query, doc) >= 6.0]
+    relevant_docs = [doc for doc in docs if score_chunk_relevance(retrieval_query, doc) >= 3.0]
 
     if not relevant_docs:
         secondary_query = build_secondary_retrieval_query(question, history=history)
         if secondary_query != retrieval_query:
             alt_docs = retriever.invoke(secondary_query)
             alt_docs = rerank(secondary_query, alt_docs, top_k=TOP_K)
-            relevant_docs = [doc for doc in alt_docs if score_chunk_relevance(secondary_query, doc) >= 6.0]
+            relevant_docs = [doc for doc in alt_docs if score_chunk_relevance(secondary_query, doc) >= 3.0]
             if relevant_docs:
                 docs = alt_docs
                 retrieval_query = secondary_query
+
+    if not relevant_docs and docs:
+        # Keep the flow grounded but avoid empty answers when strict filtering misses useful chunks.
+        scored_docs = sorted(
+            [(score_chunk_relevance(retrieval_query, doc), doc) for doc in docs],
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if scored_docs and scored_docs[0][0] >= 1.5:
+            relevant_docs = [doc for _, doc in scored_docs[: min(3, len(scored_docs))]]
 
     if not relevant_docs:
         fallback_answer = "I could not find a direct answer to this question in the retrieved documentation."

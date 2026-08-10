@@ -1,0 +1,23 @@
+{
+  "name": "garagegpt-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@group-ui/group-ui-react": "https://groupui.vwapps.run/specific/14.1.0/packages/group-ui-react.tgz",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}

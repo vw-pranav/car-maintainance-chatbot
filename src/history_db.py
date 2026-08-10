@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 
@@ -120,4 +120,4 @@ class HistoryStore:
             conn.commit()
 
     def _now(self) -> str:
-        return datetime.utcnow().isoformat(timespec="seconds")
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
