@@ -633,12 +633,41 @@ def _present_answer(question: str, answer: str, confidence: str = "HIGH") -> str
     return _strip_optional_evidence_sections(text)
 
 
+def _is_concept_explanation_question(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    if not lowered:
+        return False
+
+    concept_markers = [
+        "what is",
+        "what are",
+        "explain",
+        "define",
+        "types of",
+        "kind of",
+        "difference between",
+        "how does",
+        "how do",
+        "why does",
+    ]
+
+    return any(marker in lowered for marker in concept_markers)
+
+
+def _is_type_enumeration_question(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    return any(marker in lowered for marker in ["types of", "kinds of", "categories of", "classifications of"])
+
+
 def _build_knowledge_fallback_prompt(
     question: str,
     *,
     vehicle_question: bool,
     include_document_preface: bool,
 ) -> str:
+    concept_question = _is_concept_explanation_question(question)
+    type_enumeration_question = _is_type_enumeration_question(question)
+
     preface_rule = ""
     if vehicle_question and include_document_preface:
         preface_rule = (
@@ -650,12 +679,38 @@ def _build_knowledge_fallback_prompt(
     else:
         preface_rule = "Answer using general knowledge in a concise, clear way."
 
+    style_rule = ""
+    if vehicle_question:
+        style_rule = (
+            "Keep the answer concise and procedural for vehicle/service questions. "
+            "Use short steps or bullets only when they improve clarity."
+        )
+    elif concept_question:
+        style_rule = (
+            "Use educational formatting similar to Copilot/ChatGPT for concept questions. "
+            "Start with one direct answer sentence, then use helpful headings when useful. "
+            "Preferred section flow: Definition, Key Types/Steps, Example (if useful), Summary."
+        )
+    else:
+        style_rule = (
+            "Write in a professional, conversational style. "
+            "Start with a direct answer first, then add short structure only when useful."
+        )
+
+    type_rule = ""
+    if type_enumeration_question:
+        type_rule = (
+            "If the user asks for types/categories, provide a numbered list with each type name and a short description."
+        )
+
     return f"""
 You are GarageGPT.
 
 Answer the user naturally, concisely, and directly.
 Do not mention retrieval failures, search failures, chunking, or internal system limitations.
 {preface_rule}
+{style_rule}
+{type_rule}
 
 If the user asks for tools, torque values, diagnostic paths, prerequisites, or specifications, return a structured bullet list.
 

@@ -172,6 +172,18 @@ class ChatbotGroundingTests(unittest.TestCase):
         )
         self.assertIn("The available document does not provide details on this topic.", prompt)
         self.assertIn("Based on automotive knowledge", prompt)
+        self.assertIn("concise and procedural", prompt)
+
+    def test_general_concept_prompt_includes_educational_structure(self):
+        prompt = _build_knowledge_fallback_prompt(
+            "What are the types of polymorphism?",
+            vehicle_question=False,
+            include_document_preface=False,
+        )
+
+        self.assertIn("Start with one direct answer sentence", prompt)
+        self.assertIn("Definition, Key Types/Steps, Example (if useful), Summary", prompt)
+        self.assertIn("numbered list", prompt)
 
     def test_present_answer_removes_robotic_sections_by_default(self):
         raw = (
