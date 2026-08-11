@@ -1,4 +1,5 @@
 import logging
+import hashlib
 import os
 import re
 import sys
@@ -17,6 +18,9 @@ except ModuleNotFoundError:
 
 
 logger = logging.getLogger(__name__)
+
+
+_EVIDENCE_SNAPSHOTS: Dict[str, Dict[str, Any]] = {}
 
 
 TABLE_INTENT_MARKERS = [
@@ -323,6 +327,309 @@ def remove_duplicate_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, An
 FALLBACK_ANSWER = "Answer:\nI could not find that information in the retrieved documentation."
 NO_EVIDENCE_ANSWER = "Answer:\nI could not find that information in the retrieved documentation."
 
+VEHICLE_KNOWLEDGE_MARKERS = {
+    "vehicle", "car", "engine", "coolant", "radiator", "turbo", "turbocharger",
+    "transmission", "gearbox", "differential", "brake", "ignition", "injector",
+    "diagnostic", "obd", "dtc", "subframe", "oil", "antifreeze", "battery",
+    "ecu", "sensor", "module", "control unit", "cooling system",
+}
+
+GREETING_MARKERS = {
+    "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+    "how are you",
+    "thanks",
+    "thank you",
+}
+
+ACKNOWLEDGEMENT_MARKERS = {
+    "okay",
+    "ok",
+    "got it",
+    "understood",
+    "makes sense",
+    "cool",
+    "great",
+    "nice",
+    "alright",
+}
+
+THANKS_MARKERS = {
+    "thanks",
+    "thank you",
+    "thx",
+}
+
+FAREWELL_MARKERS = {
+    "bye",
+    "goodbye",
+    "see you",
+    "see ya",
+    "farewell",
+}
+
+
+def _classify_intent(question: str, history: List[Dict[str, Any]] | None = None) -> str:
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower()).strip("?.!")
+    if not normalized:
+        return "GENERAL"
+
+    if normalized in THANKS_MARKERS or any(normalized.startswith(marker) for marker in THANKS_MARKERS):
+        return "THANKS"
+
+    if normalized in ACKNOWLEDGEMENT_MARKERS or any(normalized.startswith(marker) for marker in ACKNOWLEDGEMENT_MARKERS):
+        return "ACKNOWLEDGEMENT"
+
+    if normalized in GREETING_MARKERS or any(normalized.startswith(marker) for marker in GREETING_MARKERS):
+        return "GREETING"
+
+    if normalized in FAREWELL_MARKERS or any(normalized.startswith(marker) for marker in FAREWELL_MARKERS):
+        return "FAREWELL"
+
+    if _is_vehicle_question(question, history=history):
+        return "QUESTION"
+
+    question_starters = (
+        "what ",
+        "why ",
+        "how ",
+        "when ",
+        "where ",
+        "which ",
+        "can ",
+        "should ",
+        "do ",
+        "does ",
+        "is ",
+        "are ",
+        "will ",
+        "would ",
+    )
+    if normalized.endswith("?") or any(normalized.startswith(starter) for starter in question_starters):
+        return "GENERAL"
+
+    return "GENERAL"
+
+
+def _classify_query_type(question: str, history: List[Dict[str, Any]] | None = None) -> str:
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower()).strip("?.!")
+    if not normalized:
+        return "GENERAL"
+    if normalized in GREETING_MARKERS or any(
+        normalized.startswith(marker) for marker in GREETING_MARKERS
+    ):
+        return "GREETING"
+    if _is_vehicle_question(question, history=history):
+        return "AUTOMOTIVE"
+    return "GENERAL"
+
+
+def _log_routing_decision(query_type: str, document_match: str, answer_source: str) -> None:
+    logger.info(
+        "QueryType: %s | DocumentMatch: %s | AnswerSource: %s",
+        query_type,
+        document_match,
+        answer_source,
+    )
+
+
+def _log_intent_route(intent: str, source: str) -> None:
+    logger.info("Intent: %s | Source: %s", intent, source)
+
+
+def _is_knowledge_fallback_answer(answer: str) -> bool:
+    lowered = (answer or "").lower()
+    return "based on automotive knowledge" in lowered or "based on general knowledge" in lowered
+
+
+def _is_consequence_followup_question(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    if not lowered:
+        return False
+    consequence_patterns = [
+        r"^what happens if\b",
+        r"^what happened if\b",
+        r"^what would happen if\b",
+        r"^what will happen if\b",
+        r"^what if\b",
+        r"\bif i\b",
+        r"\bif we\b",
+        r"\bif you\b",
+        r"\bif it\b",
+        r"\bif this\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in consequence_patterns)
+
+
+def _build_smalltalk_answer(question: str) -> str:
+    prompt = f"""
+You are GarageGPT.
+Respond to this greeting/small-talk message conversationally and briefly.
+Do not mention documentation or retrieval.
+
+User: {question}
+Assistant:
+"""
+    try:
+        response = _invoke_llm(prompt, stage="smalltalk")
+        return (response.content or "").strip()
+    except Exception:
+        return "Hello! How can I help you today?"
+
+
+def _build_conversational_answer(question: str, intent: str) -> str:
+    intent = (intent or "GENERAL").upper()
+    fallback_map = {
+        "GREETING": "Hello! How can I help you today?",
+        "ACKNOWLEDGEMENT": "Glad that helped. Let me know if you have any other questions.",
+        "THANKS": "You're welcome! Happy to help.",
+        "FAREWELL": "Goodbye! Feel free to come back if you need help with vehicle diagnostics or service procedures.",
+        "GENERAL": "I can help with that. Ask me anything and I’ll answer as clearly as I can.",
+    }
+    prompt = f"""
+You are GarageGPT.
+
+Intent: {intent}
+
+Respond naturally, conversationally, and briefly.
+Do not mention documentation or retrieval.
+Do not add a list unless the user explicitly asks for one.
+
+User: {question}
+Assistant:
+"""
+    try:
+        response = _invoke_llm(prompt, stage=f"intent_{intent.lower()}")
+        answer = (response.content or "").strip()
+        return answer or fallback_map.get(intent, fallback_map["GENERAL"])
+    except Exception:
+        return fallback_map.get(intent, fallback_map["GENERAL"])
+
+
+def _is_vehicle_question(question: str, history: List[Dict[str, Any]] | None = None) -> bool:
+    lowered = (question or "").lower()
+    if any(marker in lowered for marker in VEHICLE_KNOWLEDGE_MARKERS):
+        return True
+    if history:
+        history_text = " ".join((turn.get("content") or "") for turn in history[-4:]).lower()
+        if any(marker in history_text for marker in VEHICLE_KNOWLEDGE_MARKERS):
+            return True
+    return False
+
+
+def _should_include_evidence_sections(question: str, confidence: str = "HIGH") -> bool:
+    lowered = (question or "").lower()
+    if confidence == "LOW":
+        return True
+    evidence_markers = [
+        "how do we know",
+        "what evidence",
+        "source",
+        "reference",
+        "documentation",
+        "cite",
+        "proof",
+    ]
+    return any(marker in lowered for marker in evidence_markers)
+
+
+def _strip_optional_evidence_sections(answer: str) -> str:
+    text = (answer or "").strip()
+    if not text:
+        return text
+    text = re.sub(r"\n\nHow We Know:\n[\s\S]*?(?=\n\nAdditional Information:|\Z)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n\nAdditional Information:\n[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^Answer:\s*\n", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^Answer:\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _present_answer(question: str, answer: str, confidence: str = "HIGH") -> str:
+    text = (answer or "").strip()
+    if not text:
+        return text
+
+    include_evidence = _should_include_evidence_sections(question, confidence=confidence)
+    if include_evidence:
+        text = re.sub(r"\n\nHow We Know:\n", "\n\nReference:\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n\nAdditional Information:\n", "\n\nNotes:\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"^Answer:\s*\n", "", text, flags=re.IGNORECASE)
+        return text.strip()
+
+    return _strip_optional_evidence_sections(text)
+
+
+def _build_knowledge_fallback_prompt(
+    question: str,
+    *,
+    vehicle_question: bool,
+    include_document_preface: bool,
+) -> str:
+    preface_rule = ""
+    if vehicle_question and include_document_preface:
+        preface_rule = (
+            "Start with exactly: \"The available document does not provide details on this topic. "
+            "Based on automotive knowledge, ...\" and then answer the question clearly."
+        )
+    elif vehicle_question:
+        preface_rule = "Answer using automotive knowledge in a concise, practical way."
+    else:
+        preface_rule = "Answer using general knowledge in a concise, clear way."
+
+    return f"""
+You are GarageGPT.
+
+Answer the user naturally, concisely, and directly.
+Do not mention retrieval failures, search failures, chunking, or internal system limitations.
+{preface_rule}
+
+If the user asks for tools, torque values, diagnostic paths, prerequisites, or specifications, return a structured bullet list.
+
+Question: {question}
+Answer:
+"""
+
+
+def _build_knowledge_fallback_answer(
+    question: str,
+    *,
+    history: List[Dict[str, Any]] | None,
+    include_document_preface: bool,
+) -> str:
+    vehicle_question = _is_vehicle_question(question, history=history)
+    history_context = ""
+    if history:
+        recent_turns = []
+        for turn in history[-4:]:
+            role = (turn.get("role") or "").strip().capitalize()
+            content = (turn.get("content") or "").strip()
+            if content:
+                recent_turns.append(f"{role}: {content}")
+        history_context = "\n".join(recent_turns)
+
+    prompt = _build_knowledge_fallback_prompt(
+        question,
+        vehicle_question=vehicle_question,
+        include_document_preface=include_document_preface and vehicle_question,
+    )
+    if history_context:
+        prompt = prompt.replace(
+            "Question: {question}\nAnswer:",
+            f"Conversation context:\n{history_context}\n\nQuestion: {question}\nAnswer:",
+        )
+    try:
+        response = _invoke_llm(prompt, stage="knowledge_fallback")
+        return (response.content or "").strip()
+    except Exception:
+        if vehicle_question and include_document_preface:
+            return (
+                "The available document does not provide details on this topic. "
+                "Based on automotive knowledge, this depends on the exact vehicle and system, "
+                "so share the model and symptom and I can provide a precise answer."
+            )
+        if vehicle_question:
+            return "Based on automotive knowledge, this depends on the exact vehicle and system, so share the model and symptom for a precise answer."
+        return "Based on general knowledge, I can help with that. Share a bit more detail and I can give a precise answer."
+
 
 def _context_lines(context: str) -> List[str]:
     return [
@@ -355,15 +662,187 @@ def _build_structured_response(answer: str, how_we_know: str, additional_informa
     return "\n\n".join(sections)
 
 
-def _extract_additional_information(context: str, evidence_line: str = "") -> str:
+def _extract_additional_information(context: str, evidence_line: str = "", question: str = "") -> str:
     for line in _context_lines(context):
         normalized = line.strip()
         if not normalized:
             continue
         if evidence_line and normalized == evidence_line:
             continue
+        if question and not _line_is_subject_relevant(question, normalized):
+            continue
         return normalized
     return ""
+
+
+def _classify_evidence_type(line: str) -> str:
+    lowered = (line or "").strip().lower()
+    if not lowered:
+        return "procedure"
+
+    reason_markers = [
+        "because",
+        "reason:",
+        "the reason",
+        "this is because",
+        "for this reason",
+        "so that",
+        "in order to",
+    ]
+    warning_markers = [
+        "warning",
+        "caution",
+        "risk of injury",
+        "danger",
+        "hazard",
+    ]
+    requirement_markers = [
+        "must",
+        "required",
+        "shall",
+        "do not",
+        "cannot",
+        "must not",
+        "should not",
+        "needs to",
+    ]
+
+    if any(marker in lowered for marker in reason_markers):
+        return "reason"
+    if any(marker in lowered for marker in warning_markers):
+        return "warning"
+    if any(marker in lowered for marker in requirement_markers):
+        return "requirement"
+    if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:Nm|N\s*m|mm|cm|ml|l|bar|psi|V|A|°C|C)\b", lowered, re.IGNORECASE):
+        return "specification"
+    if re.match(r"^(?:\d+[.):-]\s*)?(?:remove|install|lower|raise|drain|fill|bleed|disconnect|connect|tighten|loosen|check|inspect|guide|open|close)\b", lowered):
+        return "procedure"
+    return "procedure"
+
+
+def _extract_reasoning_evidence(question: str, context: str) -> Dict[str, List[str]]:
+    buckets: Dict[str, List[str]] = {
+        "reason": [],
+        "warning": [],
+        "requirement": [],
+        "procedure": [],
+        "specification": [],
+    }
+    for line in _context_lines(context):
+        evidence_type = _classify_evidence_type(line)
+        if evidence_type != "reason" and not _line_is_subject_relevant(question, line):
+            continue
+        if line not in buckets[evidence_type]:
+            buckets[evidence_type].append(line)
+    return buckets
+
+
+def build_reasoning_answer_from_evidence(question: str, context: str) -> str | None:
+    if not _is_explanatory_question(question):
+        return None
+
+    evidence = _extract_reasoning_evidence(question, context)
+    reason_lines = evidence["reason"]
+    question_lower = (question or "").lower()
+
+    if reason_lines:
+        answer = reason_lines[0]
+        return f"Documented Reason:\n{answer}"
+
+    support_lines: List[str] = []
+    if evidence["procedure"]:
+        support_lines.extend(evidence["procedure"][:2])
+    if evidence["requirement"]:
+        support_lines.extend(evidence["requirement"][:2])
+    if evidence["warning"]:
+        support_lines.extend(evidence["warning"][:1])
+    if evidence["specification"]:
+        support_lines.extend(evidence["specification"][:1])
+
+    if not support_lines:
+        support_lines.append("No explicit reason statement appears in the retrieved text.")
+
+    fact_source = support_lines[0]
+    if question_lower.startswith("what happens if") or "what happens if" in question_lower or "what if" in question_lower:
+        consequence = _build_automotive_why_explanation(question, context, history=None)
+        return (
+            f"The documentation states {fact_source.rstrip('.')}.\n\n"
+            "The documentation does not explicitly explain the consequences.\n\n"
+            "Based on automotive knowledge:\n"
+            f"{consequence}"
+        )
+
+    explanation = _build_automotive_why_explanation(question, context, history=None)
+    return (
+        f"{_REASON_NOT_EXPLICIT} It only describes the procedure.\n\n"
+        "Based on automotive knowledge:\n"
+        f"{explanation}"
+    )
+
+
+_REASON_NOT_EXPLICIT = "The documentation does not explicitly state the reason."
+
+
+def _build_automotive_why_explanation(
+    question: str,
+    context: str,
+    history: List[Dict[str, Any]] | None = None,
+) -> str:
+    prompt = f"""
+You are GarageGPT.
+The service documentation does not provide an explicit reason.
+
+Task:
+- Provide a concise automotive-knowledge explanation for the WHY question.
+- Do not claim the explanation is stated in documentation.
+- Do not contradict the documented fact.
+- Keep it to 1-2 short sentences.
+- Start directly with the explanation text.
+
+Question: {question}
+Context summary:
+{(context or "")[:700]}
+
+Explanation:
+"""
+    try:
+        response = _invoke_llm(prompt, stage="why_automotive_knowledge")
+        return re.sub(r"\s+", " ", (response.content or "")).strip().strip('"')
+    except Exception:
+        return (
+            "Automotive systems often specify this to prevent component damage, "
+            "maintain reliability, and preserve performance over time."
+        )
+
+
+def _format_reasoning_answer(
+    question: str,
+    base_answer: str,
+    context: str,
+    history: List[Dict[str, Any]] | None = None,
+) -> str:
+    normalized = re.sub(r"\s+", " ", (base_answer or "")).strip()
+    if not normalized:
+        return normalized
+
+    if normalized.lower().startswith("documented reason:"):
+        return normalized
+
+    if normalized.lower().startswith("the documentation states "):
+        return normalized
+
+    if normalized.lower().startswith("the documentation does not explicitly explain"):
+        return normalized
+
+    if normalized.lower().startswith(_REASON_NOT_EXPLICIT.lower()):
+        explanation = _build_automotive_why_explanation(question, context, history=history)
+        return (
+            f"{_REASON_NOT_EXPLICIT}\n\n"
+            "Based on automotive knowledge:\n"
+            f"{explanation}"
+        )
+
+    return f"Documented Reason:\n{normalized}"
 
 
 def _join_wrapped_lines(lines: List[str]) -> List[str]:
@@ -390,6 +869,36 @@ def _format_evidence_block(title: str, text: str) -> str:
     if not cleaned:
         return f"{title}:\n<none>"
     return f"{title}:\n{cleaned}"
+
+
+def _format_procedurally_aware_context(top_chunk: str, secondary_chunks: List[str]) -> str:
+    """
+    Format context to strongly emphasize top chunk and prevent mixing procedures.
+    
+    Uses clear visual separation and ordering to make it obvious which chunk 
+    should be primary evidence for the answer.
+    """
+    sections = []
+    
+    # TOP CHUNK IS PRIMARY
+    if top_chunk.strip():
+        sections.append("=== PRIMARY EVIDENCE (Most Relevant) ===")
+        sections.append(clean_context(top_chunk))
+        sections.append("")
+    
+    # Secondary chunks ONLY if same procedure
+    filtered_secondary = []
+    for chunk in (secondary_chunks or []):
+        if chunk.strip() and _is_same_procedure(top_chunk, chunk):
+            filtered_secondary.append(chunk)
+    
+    if filtered_secondary:
+        sections.append("=== SUPPORTING EVIDENCE (Same Procedure) ===")
+        for i, chunk in enumerate(filtered_secondary[:2], start=1):
+            sections.append(f"--- Evidence {i} ---")
+            sections.append(clean_context(chunk))
+    
+    return "\n".join(sections)
 
 
 def _question_tokens(question: str) -> set[str]:
@@ -439,31 +948,276 @@ def extract_yes_no_answer(question: str, context: str) -> Dict[str, str] | None:
     return None
 
 
+_MENU_QUESTION_MARKERS = [
+    "diagnostic system",
+    "diagnostic-capable",
+    "menu",
+    "menu level",
+    "control unit",
+    "guided function",
+    "guided functions",
+    "adaptation",
+    "diagnostic path",
+    "continue the path",
+    "next menu",
+    "after that",
+]
+
+_MENU_INSTRUCTION_MARKERS = [
+    "start the selected program",
+    "follow the instructions",
+    "select the program",
+    "perform the procedure",
+    "continue as guided",
+    "read and follow",
+    "carry out the following steps",
+]
+
+_MENU_NODE_MARKERS = [
+    "diagnostic-capable systems",
+    "diagnostic system",
+    "engine electronics",
+    "control unit",
+    "guided functions",
+    "guided function",
+    "adaptation",
+    "coolant circuit bleeding procedure",
+    "bleeding procedure",
+]
+
+_MENU_ARROW = re.compile(r"^\s*(?:[→➜➔▸>]\s*)+")
+_MENU_NUMBER = re.compile(r"^\s*\d+\s*[.):\-]\s*")
+
+_PAGE_REFERENCE = re.compile(r"^(?:page\s*)?\d{1,4}\s*$|\s(?:page|p\.?)[\s:-]*\d{1,4}\s*$", re.IGNORECASE)
+_TRAILING_PAGE_NUMBER = re.compile(r"\s+\d{1,4}\s*$")
+_DOCUMENT_TITLE_MARKERS = [
+    "edition ",
+    "workshop manual",
+    "repair manual",
+    "cylinder direct fuel injection",
+    "tfsI engine ea 839",
+    "engine ea 839",
+]
+_SECTION_HEADER_MARKERS = [
+    "repair group",
+    "chapter",
+    "contents",
+    "cooling system/coolant",
+    "removing and installing",
+]
+
+
+def _normalise_menu_line(line: str) -> tuple[str, bool]:
+    """Return text and whether the source line explicitly marks a menu node."""
+    stripped = (line or "").strip()
+    marked = bool(_MENU_ARROW.match(stripped) or _MENU_NUMBER.match(stripped))
+    normalized = _MENU_ARROW.sub("", stripped)
+    normalized = _MENU_NUMBER.sub("", normalized).strip(" •-*\t")
+    return normalized, marked
+
+
+def _classify_content_line(line: str, explicitly_marked: bool = False) -> str:
+    """Classify a line before it can be considered a diagnostic menu node."""
+    text = (line or "").strip()
+    lowered = text.lower()
+    if not text:
+        return "Header"
+    if _PAGE_REFERENCE.search(text) or (_TRAILING_PAGE_NUMBER.search(text) and "/" in text):
+        return "Page Reference"
+    if any(marker.lower() in lowered for marker in _DOCUMENT_TITLE_MARKERS):
+        return "Document Title"
+    if any(marker in lowered for marker in _SECTION_HEADER_MARKERS):
+        return "Section Header"
+    if any(marker in lowered for marker in ["warning", "caution", "danger"]):
+        return "Warning"
+    if any(marker in lowered for marker in ["must", "required", "prerequisite", "condition"]):
+        return "Requirement"
+    if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:Nm|N\s*m|mm|cm|ml|l|bar|psi|V|A|°C|C)\b", text, re.IGNORECASE):
+        return "Specification"
+    if any(marker in lowered for marker in ["special tool", "workshop equipment", "vas ", "vag ", "adapter"]):
+        return "Tool List"
+    if any(marker in lowered for marker in _MENU_INSTRUCTION_MARKERS) or re.match(
+        r"^(?:start|select|follow|perform|continue|open|close|check|connect|disconnect|read|carry out)\b",
+        lowered,
+    ):
+        return "Procedure Step"
+    if explicitly_marked or _is_menu_node(text):
+        return "Menu Item"
+    return "Header"
+
+
+def _is_menu_node(line: str, explicitly_marked: bool = False) -> bool:
+    lowered = (line or "").strip().lower()
+    if not lowered or any(marker in lowered for marker in _MENU_INSTRUCTION_MARKERS):
+        return False
+    if re.match(r"^(?:start|select|follow|perform|continue|open|close|check|read|carry out)\b", lowered):
+        return False
+    if explicitly_marked:
+        return any(marker in lowered for marker in _MENU_NODE_MARKERS)
+    return any(marker in lowered for marker in _MENU_NODE_MARKERS)
+
+
+def extract_menu_structure(context: str) -> Dict[str, Any]:
+    """Separate menu nodes from procedure instructions and other evidence."""
+    menu_path: List[str] = []
+    procedure_steps: List[str] = []
+    requirements: List[str] = []
+    warnings: List[str] = []
+    specifications: List[str] = []
+    content_types: List[Dict[str, str]] = []
+    in_menu_block = False
+
+    for raw_line in (context or "").splitlines():
+        normalized, explicitly_marked = _normalise_menu_line(raw_line)
+        lowered = normalized.lower()
+        if not normalized or lowered.startswith("retrieved evidence"):
+            continue
+
+        content_type = _classify_content_line(normalized, explicitly_marked)
+        content_types.append({"text": normalized, "type": content_type})
+        logger.info("Content Type: %s | Text: %s", content_type, normalized)
+
+        if content_type == "Menu Item":
+            menu_path.append(normalized)
+            in_menu_block = True
+            continue
+
+        if in_menu_block and (
+            any(marker in lowered for marker in _MENU_INSTRUCTION_MARKERS)
+            or re.match(r"^(?:start|select|follow|perform|continue|open|close)\b", lowered)
+        ):
+            in_menu_block = False
+
+        if content_type == "Warning":
+            warnings.append(normalized)
+        elif content_type == "Requirement":
+            requirements.append(normalized)
+        elif content_type == "Specification":
+            specifications.append(normalized)
+        elif content_type in {"Procedure Step", "Tool List"}:
+            procedure_steps.append(normalized)
+
+    return {
+        "menu_path": list(dict.fromkeys(menu_path)),
+        "procedure_steps": list(dict.fromkeys(procedure_steps)),
+        "requirements": list(dict.fromkeys(requirements)),
+        "warnings": list(dict.fromkeys(warnings)),
+        "specifications": list(dict.fromkeys(specifications)),
+        "content_types": content_types,
+    }
+
+
 def extract_diagnostic_path(question: str, context: str) -> List[str]:
-    """Extract ordered diagnostic menu entries from adjacent evidence lines."""
+    """Extract selectable menu nodes while excluding instructional text."""
     question_lower = (question or "").lower()
-    context_lines = _context_lines(context)
-    if not any(term in question_lower for term in ["control unit", "diagnostic", "menu", "system"]):
+    structure = extract_menu_structure(context)
+    if not any(term in question_lower for term in _MENU_QUESTION_MARKERS) and not structure["menu_path"]:
+        return []
+    return structure["menu_path"] if len(structure["menu_path"]) >= 2 else []
+
+
+DIAGNOSTIC_PATH_NOT_FOUND = "I could not find a diagnostic menu path in the retrieved documentation."
+
+
+_LIST_QUESTION_MARKERS = [
+    "prerequisite",
+    "prerequisites",
+    "prior condition",
+    "prior conditions",
+    "conditions must be met",
+    "conditions to be met",
+    "before starting",
+    "before you start",
+    "what checks",
+    "what must be",
+    "what conditions",
+    "what are the requirements",
+    "what requirements",
+    "checks must be completed",
+    "checks required",
+    "requirements for",
+    "requirements before",
+    "initial conditions",
+]
+
+_LIST_SECTION_HEADERS = re.compile(
+    r"(?i)^\s*(?:"
+    r"prerequisite[s]?|prior conditions?|initial conditions?|"
+    r"conditions(?:\s+for|\s+to)?|requirements?(?:\s+before|\s+for)?|"
+    r"before(?:\s+starting|\s+you\s+start)?|checks?(?:\s+required|\s+to\s+perform)?|"
+    r"preparation|note[s]?|caution[s]?|warning[s]?"
+    r")\s*:?\s*$"
+)
+
+_BULLET_LINE = re.compile(r"^\s*(?:[•\-\*\u2022\u25e6\u2023]|\d+[.):-])\s+")
+
+
+def _is_list_question(question: str) -> bool:
+    q = (question or "").lower()
+    return any(marker in q for marker in _LIST_QUESTION_MARKERS)
+
+
+def extract_checklist_items(question: str, context: str) -> List[str]:
+    """Extract ALL items from a checklist or prerequisite section."""
+    if not _is_list_question(question):
         return []
 
-    path = []
-    for line in context_lines:
-        normalized = re.sub(r"^\d+\s*[-:]\s*", "", line).strip()
-        lowered = normalized.lower()
-        if any(
-            marker in lowered
-            for marker in [
-                "engine electronics",
-                "coolant circuit bleeding",
-                "bleeding procedure",
-            ]
-        ):
-            if normalized not in path:
-                path.append(normalized)
+    raw_lines = [line.rstrip() for line in (context or "").splitlines()]
+    items: List[str] = []
+    collecting = False
+    max_gap = 2   # blank lines allowed inside a list block
+    gap = 0
 
-    if len(path) >= 2:
-        return path
-    return []
+    for line in raw_lines:
+        stripped = line.strip()
+        is_bullet = bool(_BULLET_LINE.match(line)) or (stripped and stripped[0] in "•\u2022\u25e6\u2023")
+        is_header = bool(_LIST_SECTION_HEADERS.match(stripped))
+
+        if is_header:
+            collecting = True
+            gap = 0
+            continue
+
+        if not stripped:
+            if collecting:
+                gap += 1
+                if gap > max_gap:
+                    break
+            continue
+        else:
+            gap = 0
+
+        if collecting:
+            # Numbered procedure steps always end the prerequisite block
+            if re.match(r"^\d+[.):-]\s+\S", stripped):
+                break
+            # Named section markers also end the block
+            if re.match(r"^(?:Note|Caution|Warning|Step|Procedure)\s+", stripped, re.IGNORECASE) and not is_bullet:
+                break
+            candidate = _BULLET_LINE.sub("", line).strip()
+            candidate = re.sub(r"^[•\-\*\u2022\s]+", "", candidate).strip()
+            if candidate and candidate not in items:
+                items.append(candidate)
+        elif is_bullet:
+            # Collect bare bullet blocks even without a recognised header
+            candidate = _BULLET_LINE.sub("", line).strip()
+            candidate = re.sub(r"^[•\-\*\u2022\s]+", "", candidate).strip()
+            if candidate and candidate not in items:
+                items.append(candidate)
+
+    # If we only got one item that way, fall back to scanning all context_lines for
+    # lines that look like short checklist conditions (≤ 10 words, no verb phrase).
+    if len(items) <= 1:
+        question_lower = (question or "").lower()
+        for cl in _context_lines(context):
+            if len(cl.split()) <= 12 and not cl.lower().startswith("retrieved evidence"):
+                low = cl.lower()
+                if any(kw in low for kw in ["position", "activated", "closed", "checked", "connected", "engaged", "off", "on", "in place"]):
+                    clean = re.sub(r"^[•\-\*\u2022\s]+", "", cl).strip()
+                    if clean and clean not in items:
+                        items.append(clean)
+
+    return items
 
 
 def extract_tool_list(question: str, context: str) -> List[str]:
@@ -511,14 +1265,15 @@ def extract_direct_answer_sentences(question: str, context: str) -> List[str]:
             return matches
 
     if any(term in question_lower for term in ["how is", "how do i", "how do we", "removing", "installing"]):
-        tokens = _question_tokens(question)
         ranked = []
         for line in lines:
             lowered = line.lower()
-            overlap = len(tokens.intersection(set(re.findall(r"[a-z0-9]+", lowered))))
-            if overlap >= 2 or any(marker in lowered for marker in ["remove", "install", "lower", "bleed", "drain"]):
+            overlap = _line_subject_score(question, line)
+            if overlap <= 0:
+                continue
+            if any(marker in lowered for marker in ["remove", "install", "lower", "bleed", "drain", "guide", "reuse", "coolant", "engine", "subframe"]):
                 ranked.append((overlap, line))
-        ranked.sort(key=lambda item: item[0], reverse=True)
+        ranked.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
         return [line for _, line in ranked[:3]]
 
     return []
@@ -685,6 +1440,7 @@ def extract_structured_evidence(question: str, context: str) -> Dict[str, object
     yes_no = extract_yes_no_answer(question, context)
     diagnostic_path = extract_diagnostic_path(question, context)
     tool_list = extract_tool_list(question, context)
+    checklist_items = extract_checklist_items(question, context)
     direct_answer_sentences = extract_direct_answer_sentences(question, context)
     lines = _context_lines(context)
     question_lower = (question or "").lower()
@@ -699,8 +1455,9 @@ def extract_structured_evidence(question: str, context: str) -> Dict[str, object
     ]
     part_numbers = sorted(set(re.findall(r"\b(?:part|item)?\s*(?:no\.?|number)\s*[A-Z0-9][A-Z0-9./-]*\b", context, re.IGNORECASE)))
     specifications = extract_specification_list(context)
+    reasoning_evidence = _extract_reasoning_evidence(question, context)
 
-    direct = bool(table_answer or yes_no or diagnostic_path or tool_list or direct_answer_sentences)
+    direct = bool(table_answer or yes_no or diagnostic_path or tool_list or checklist_items or direct_answer_sentences)
     overlap = _question_tokens(question).intersection(
         set(re.findall(r"[a-z0-9]+", (context or "").lower()))
     )
@@ -726,10 +1483,12 @@ def extract_structured_evidence(question: str, context: str) -> Dict[str, object
         "diagnostic_path": diagnostic_path,
         "direct_answer_sentences": direct_answer_sentences,
         "tool_list": tool_list,
+        "checklist_items": checklist_items,
         "procedure_names": procedure_names,
         "tool_names": tool_names,
         "part_numbers": part_numbers,
         "specifications": specifications,
+        "reasoning_evidence": reasoning_evidence,
     }
 
 
@@ -738,6 +1497,15 @@ def build_extracted_answer(question: str, context: str, evidence: Dict[str, obje
     table_answer = evidence.get("table_answer")
     if isinstance(table_answer, str) and table_answer.strip():
         return table_answer
+
+    # Checklist / prerequisite questions – return ALL items, not just the first.
+    checklist_items = evidence.get("checklist_items")
+    if isinstance(checklist_items, list) and len(checklist_items) >= 1:
+        label = "Prerequisites:" if _is_list_question(question) else "Requirements:"
+        answer_lines = [label]
+        answer_lines.extend([f"\u2022 {item}" for item in checklist_items])
+        how_we_know = "The retrieved documentation lists these conditions directly."
+        return _build_structured_response("\n".join(answer_lines), how_we_know)
 
     yes_no = evidence.get("yes_no")
     if isinstance(yes_no, dict):
@@ -754,7 +1522,7 @@ def build_extracted_answer(question: str, context: str, evidence: Dict[str, obje
                     f"Yes. The documentation indicates that "
                     f"{evidence_line[0].lower() + evidence_line[1:]}"
                 )
-        additional = _extract_additional_information(context, evidence_line=evidence_line)
+        additional = _extract_additional_information(context, evidence_line=evidence_line, question=question)
         return _build_structured_response(answer, evidence_line or yes_no["answer"], additional)
 
     tool_list = evidence.get("tool_list")
@@ -768,10 +1536,11 @@ def build_extracted_answer(question: str, context: str, evidence: Dict[str, obje
     if isinstance(diagnostic_path, list) and diagnostic_path:
         answer_lines = ["Use this diagnostic path:"]
         answer_lines.extend([f"• {item}" for item in diagnostic_path])
-        additional = _extract_additional_information(context, evidence_line=diagnostic_path[-1])
+        additional = _extract_additional_information(context, evidence_line=diagnostic_path[-1], question=question)
+        support_path = diagnostic_path[1:] if len(diagnostic_path) > 1 else diagnostic_path
         return _build_structured_response(
             "\n".join(answer_lines),
-            "The retrieved documentation lists this path: " + " -> ".join(diagnostic_path),
+            "The retrieved documentation lists this path: " + " -> ".join(support_path),
             additional,
         )
 
@@ -779,7 +1548,7 @@ def build_extracted_answer(question: str, context: str, evidence: Dict[str, obje
     if isinstance(direct_answer_sentences, list) and direct_answer_sentences:
         answer = " ".join(direct_answer_sentences[:2])
         how_we_know = direct_answer_sentences[0]
-        additional = _extract_additional_information(context, evidence_line=direct_answer_sentences[0])
+        additional = _extract_additional_information(context, evidence_line=direct_answer_sentences[0], question=question)
 
         if any(marker in question.lower() for marker in ["how is the engine removed", "removed from the vehicle"]):
             answer = "The engine is removed by lowering the engine/transmission assembly together with the subframe and removing it from underneath the vehicle."
@@ -793,20 +1562,113 @@ def build_extracted_answer(question: str, context: str, evidence: Dict[str, obje
 
 
 def assess_answer_confidence(question: str, top_chunk: str, secondary_chunks: List[str]) -> str:
+    """
+    Assess answer confidence with ranking preference.
+    
+    HIGH: Top chunk directly answers the question
+    MEDIUM: Top chunk is relevant but doesn't directly answer; secondary chunks may help
+    LOW: No chunk provides relevant evidence
+    """
     top_evidence = extract_structured_evidence(question, top_chunk)
     if top_evidence["confidence"] == "HIGH":
         return "HIGH"
 
-    combined_secondary = "\n".join(secondary_chunks)
-    if combined_secondary:
-        secondary_evidence = extract_structured_evidence(question, combined_secondary)
-        if secondary_evidence["confidence"] in {"HIGH", "MEDIUM"}:
+    # Only look at secondary if top is completely empty
+    if not top_chunk.strip():
+        combined_secondary = "\n".join(secondary_chunks)
+        if combined_secondary:
+            secondary_evidence = extract_structured_evidence(question, combined_secondary)
+            if secondary_evidence["confidence"] in {"HIGH", "MEDIUM"}:
+                return "MEDIUM"
+    else:
+        # Top chunk exists; only upgrade confidence if it's at least medium
+        if top_evidence["confidence"] == "MEDIUM":
             return "MEDIUM"
 
-    if top_evidence["confidence"] == "MEDIUM":
-        return "MEDIUM"
-
     return "LOW"
+
+
+def extract_answer_from_top_chunk_only(question: str, top_chunk: str) -> str | None:
+    """
+    Extract answer from TOP CHUNK ONLY, not from secondary chunks.
+    This prevents mixing evidence from different procedures.
+    
+    Returns None if top chunk doesn't directly answer the question.
+    """
+    if not top_chunk.strip():
+        return None
+    
+    evidence = extract_structured_evidence(question, top_chunk)
+    
+    # Only extract if confidence is HIGH
+    if evidence["confidence"] != "HIGH":
+        return None
+    
+    # Build from top chunk evidence
+    extracted = build_extracted_answer(question, top_chunk, evidence)
+    if extracted:
+        return extracted
+    
+    # Fallback: check for direct answer sentences
+    direct_sentences = evidence.get("direct_answer_sentences")
+    if isinstance(direct_sentences, list) and direct_sentences:
+        return " ".join(direct_sentences[:2])
+    
+    return None
+
+
+def validate_answer_grounding(question: str, top_chunk: str, answer: str) -> bool:
+    """
+    Verify that an answer is grounded in the top chunk evidence.
+    
+    Returns False if answer appears to come from different procedure/topic.
+    """
+    if not answer or not top_chunk:
+        return False
+    
+    # Check if answer is a fallback message
+    if is_fallback_answer(answer):
+        return True  # Fallback is valid if no evidence exists
+    
+    # Check if top chunk and answer are from same procedure
+    top_proc = _detect_procedure_section(top_chunk)
+    answer_proc = _detect_procedure_section(answer)
+    
+    # If we can identify procedures and they don't match, it's not grounded
+    if top_proc != "unknown" and answer_proc != "unknown" and top_proc != answer_proc:
+        return False
+    
+    # Check for major semantic disconnect
+    answer_lower = answer.lower()
+    top_lower = top_chunk.lower()
+    
+    # Detect if answer talks about different component/procedure
+    answer_topics = {
+        "coolant": "coolant" in answer_lower,
+        "engine": "engine" in answer_lower,
+        "transmission": "transmission" in answer_lower,
+        "brake": "brake" in answer_lower,
+        "fuel": "fuel" in answer_lower,
+    }
+    
+    top_topics = {
+        "coolant": "coolant" in top_lower,
+        "engine": "engine" in top_lower,
+        "transmission": "transmission" in top_lower,
+        "brake": "brake" in top_lower,
+        "fuel": "fuel" in top_lower,
+    }
+    
+    # If answer mentions a topic not in top chunk, check if it's justified
+    answer_exclusive_topics = [topic for topic, present in answer_topics.items() if present and not top_topics.get(topic)]
+    if answer_exclusive_topics and not any(
+        marker in answer_lower 
+        for marker in ["also", "additionally", "in addition", "related", "however", "but"]
+    ):
+        # Answer introduced new topics not in top chunk without transitions
+        return False
+    
+    return True
 
 
 def is_fallback_answer(answer: str) -> bool:
@@ -816,15 +1678,23 @@ def is_fallback_answer(answer: str) -> bool:
         NO_EVIDENCE_ANSWER.lower(),
         "i could not find this information in the available documentation.",
         "i don't know.",
+        "the available document does not provide details on this topic.",
     }
 
 
-def _top_evidence_line(text: str) -> str:
+def _top_evidence_line(text: str, question: str = "") -> str:
+    fallback_line = ""
     for line in _context_lines(text):
         normalized = re.sub(r"^[\-•\u2022\s]+", "", line).strip()
-        if normalized:
+        if not normalized:
+            continue
+        if not question:
             return normalized
-    return ""
+        if _line_is_subject_relevant(question, normalized, allow_reason_only=True):
+            return normalized
+        if not fallback_line:
+            fallback_line = normalized
+    return fallback_line
 
 
 def build_evidence_fallback_answer(
@@ -839,11 +1709,14 @@ def build_evidence_fallback_answer(
         return extracted
 
     if evidence.get("confidence") in {"HIGH", "MEDIUM"}:
-        support = _top_evidence_line(top_chunk)
+        support = _top_evidence_line(top_chunk, question)
         if support:
             return _build_structured_response(support, support)
 
-    return NO_EVIDENCE_ANSWER
+    return (
+        "The available document does not provide details on this topic. "
+        "Based on automotive knowledge, please share the exact model/year or symptom and I can provide a precise answer."
+    )
 
 
 def _normalize_text(text):
@@ -887,6 +1760,44 @@ def _extract_keywords(text):
         "as",
     }
     return [token for token in tokens if token not in stop_words and len(token) >= 3]
+
+
+def _question_subject_tokens(question: str) -> List[str]:
+    tokens = set(_question_tokens(question))
+    lowered = (question or "").lower()
+    if "cooling system" in lowered:
+        tokens.update({"cooling", "system"})
+    if "used coolant" in lowered or "coolant" in lowered:
+        tokens.add("coolant")
+    if "engine/transmission" in lowered or "engine transmission" in lowered:
+        tokens.update({"engine", "transmission"})
+    if "diagnostic" in lowered or "menu" in lowered:
+        tokens.add("diagnostic")
+    if "subframe" in lowered:
+        tokens.add("subframe")
+    return sorted(tokens)
+
+
+def _line_subject_score(question: str, line: str) -> int:
+    question_tokens = set(_question_subject_tokens(question))
+    if not question_tokens:
+        return 0
+    line_tokens = set(re.findall(r"[a-z0-9]+", (line or "").lower()))
+    return len(question_tokens.intersection(line_tokens))
+
+
+def _line_is_subject_relevant(question: str, line: str, *, allow_reason_only: bool = False) -> bool:
+    if not line:
+        return False
+    if _line_subject_score(question, line) > 0:
+        return True
+    if not allow_reason_only:
+        return False
+    lowered = line.lower()
+    return any(
+        marker in lowered
+        for marker in ["because", "reason:", "the reason", "this is because", "for this reason", "so that", "in order to"]
+    )
 
 
 def _is_followup_question(question, history=None):
@@ -950,6 +1861,183 @@ def build_secondary_retrieval_query(question, history=None):
     return base_query
 
 
+def _topic_from_text(text: str) -> str:
+    lowered = (text or "").lower()
+    if "coolant" in lowered and any(term in lowered for term in ["reuse", "reused", "reusable"]):
+        return "coolant reuse"
+    if "engine" in lowered and any(term in lowered for term in ["remov", "lower", "transmission", "subframe"]):
+        return "engine removal"
+    if "cooling system" in lowered and any(term in lowered for term in ["tester", "leak", "checking"]):
+        return "cooling system tester"
+    if "fuel" in lowered and "pressure" in lowered:
+        return "fuel pressure"
+    if "radiator" in lowered:
+        return "radiator"
+    if "transmission" in lowered:
+        return "transmission"
+    if "coolant" in lowered:
+        return "coolant system"
+    if "engine" in lowered:
+        return "engine"
+    return "unknown"
+
+
+def _previous_user_topic(history: List[Dict[str, Any]] | None, question: str) -> str:
+    normalized_question = re.sub(r"\s+", " ", (question or "").strip().lower()).rstrip("?.!")
+    for turn in reversed(history or []):
+        if (turn.get("role") or "").lower() != "user":
+            continue
+        content = (turn.get("content") or "").strip()
+        normalized_content = re.sub(r"\s+", " ", content.lower()).rstrip("?.!")
+        if content and normalized_content != normalized_question:
+            return _topic_from_text(content)
+    return "unknown"
+
+
+def _log_context_decision(
+    question_type: str,
+    previous_topic: str,
+    current_topic: str,
+    context_used: bool,
+) -> None:
+    logger.info(
+        "Question Type: %s | Previous Topic: %s | Current Topic: %s | Context Used: %s",
+        question_type,
+        previous_topic,
+        current_topic,
+        "Yes" if context_used else "No",
+    )
+
+
+def _is_evidence_followup(question: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower())
+    return bool(re.match(
+        r"^(how do we know|what evidence supports that|where is that stated|are you sure)\??$",
+        normalized,
+    ))
+
+
+def _is_menu_navigation_followup(question: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower()).rstrip("?.!")
+    return bool(re.match(
+        r"^(which diagnostic system is selected|what is the next menu level|and after that|continue the path|what comes next|what is next)\??$",
+        normalized,
+    ))
+
+
+def _is_diagnostic_path_question(question: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower())
+    return (
+        _is_menu_navigation_followup(question)
+        or "which diagnostic system" in normalized
+        or "which control unit" in normalized
+        or "diagnostic menu" in normalized
+        or "diagnostic path" in normalized
+        or "menu level" in normalized
+    )
+
+
+def _menu_pointer_for_question(question: str, menu_path: List[str], previous_pointer: int = -1) -> int:
+    """Advance the menu pointer only for navigation questions."""
+    if not menu_path:
+        return -1
+    normalized = re.sub(r"\s+", " ", (question or "").strip().lower()).rstrip("?.!")
+    if normalized.startswith("which diagnostic system"):
+        return min(1 if len(menu_path) > 1 else 0, len(menu_path) - 1)
+    if normalized in {"what is the next menu level", "what is next", "what comes next", "and after that", "continue the path"}:
+        return min(previous_pointer + 1, len(menu_path) - 1)
+    return previous_pointer
+
+
+def _build_menu_navigation_answer(snapshot: Dict[str, Any], question: str) -> str:
+    evidence = snapshot.get("evidence") or {}
+    menu_path = evidence.get("diagnostic_path") or []
+    if not isinstance(menu_path, list) or not menu_path:
+        return DIAGNOSTIC_PATH_NOT_FOUND
+    pointer = _menu_pointer_for_question(question, menu_path, int(snapshot.get("menu_pointer", -1)))
+    if pointer < 0:
+        return DIAGNOSTIC_PATH_NOT_FOUND
+    item = menu_path[pointer]
+    return _build_structured_response(
+        item,
+        f"This is menu level {pointer + 1} of the diagnostic path: " + " -> ".join(menu_path),
+    )
+
+
+def _evidence_snapshot_key(session_id: Any, history: List[Dict[str, Any]] | None) -> str:
+    if session_id is not None:
+        return f"session:{session_id}"
+    history_text = "\n".join(
+        f"{item.get('role', '')}:{item.get('content', '')}"
+        for item in (history or [])[-6:]
+    )
+    digest = hashlib.sha256(history_text.encode("utf-8")).hexdigest()[:16]
+    return f"history:{digest}"
+
+
+def _build_evidence_ids(entries: List[Dict[str, Any]]) -> List[str]:
+    evidence_ids = []
+    for index, entry in enumerate(entries, start=1):
+        metadata = entry.get("metadata") or {}
+        source = metadata.get("source") or metadata.get("file_name") or "retrieved-document"
+        page = metadata.get("page")
+        suffix = f":page-{page}" if page is not None else f":chunk-{index}"
+        evidence_ids.append(f"{source}{suffix}")
+    return evidence_ids
+
+
+def _store_evidence_snapshot(
+    session_id: Any,
+    history: List[Dict[str, Any]] | None,
+    question: str,
+    answer: str,
+    cleaned_entries: List[Dict[str, Any]],
+    evidence: Dict[str, object],
+) -> None:
+    menu_path = evidence.get("diagnostic_path") or []
+    _EVIDENCE_SNAPSHOTS[_evidence_snapshot_key(session_id, history)] = {
+        "question": question,
+        "answer": answer,
+        "top_chunks": [entry.get("text", "") for entry in cleaned_entries[:3]],
+        "evidence_ids": _build_evidence_ids(cleaned_entries[:3]),
+        "evidence": evidence,
+        "menu_pointer": -1 if not menu_path else 0,
+    }
+
+
+def _build_evidence_followup_answer(snapshot: Dict[str, Any]) -> str:
+    evidence = snapshot.get("evidence") or {}
+    diagnostic_path = evidence.get("diagnostic_path")
+    top_chunks = [chunk for chunk in snapshot.get("top_chunks", []) if chunk]
+    evidence_ids = snapshot.get("evidence_ids", [])
+
+    if isinstance(diagnostic_path, list) and diagnostic_path:
+        lines = [
+            "Answer:",
+            "We know this because the coolant bleeding procedure explicitly instructs the technician to navigate through:",
+            *[f"• {item}" for item in diagnostic_path],
+            "",
+            "How We Know:",
+            "• This menu path is listed directly in the retrieved procedure.",
+        ]
+        if evidence_ids:
+            lines.extend(["", "Evidence IDs:", *[f"• {item}" for item in evidence_ids]])
+        return "\n".join(lines)
+
+    supporting = top_chunks[0] if top_chunks else "The previous answer was based on the retrieved documentation."
+    lines = [
+        "Answer:",
+        "We know this because the previous answer was supported by the following retrieved evidence:",
+        f"• {supporting}",
+        "",
+        "How We Know:",
+        "• This evidence was retrieved for the previous question and is being reused without a new topic search.",
+    ]
+    if evidence_ids:
+        lines.extend(["", "Evidence IDs:", *[f"• {item}" for item in evidence_ids]])
+    return "\n".join(lines)
+
+
 def score_chunk_relevance(question, doc):
     if not doc:
         return 0.0
@@ -1010,10 +2098,158 @@ def score_chunk_relevance(question, doc):
         if term in question_lower and (term in content_lower or term in section_lower):
             score += 1.5
 
+    if _is_diagnostic_path_question(question):
+        diagnostic_markers = [
+            "select diagnostic",
+            "individual tests",
+            "diagnostic-capable systems",
+            "engine electronics",
+            "guided functions",
+            "guided function",
+            "adaptation",
+            "basic settings",
+            "basic setting",
+            "select the following tree structures",
+            "tree structure",
+        ]
+        score += sum(marker in content_lower for marker in diagnostic_markers) * 2.0
+
     if "engine" in content_lower and any(term in content_lower for term in ["transmission", "subframe", "assembly", "removal"]):
         score += 2.0
 
     return round(score, 2)
+
+
+def _is_engine_removal_question(question: str) -> bool:
+    lowered = (question or "").lower()
+    return "engine" in lowered and any(term in lowered for term in ["remove", "removed", "removal", "lowering"])
+
+
+def _detect_procedure_section(chunk_text: str) -> str:
+    """
+    Identify the procedure/repair section that a chunk belongs to.
+    
+    Returns: procedure name (e.g., "engine_removal", "coolant_bleeding", "cooling_system_tester")
+    Used to prevent mixing evidence from different procedures.
+    """
+    text_lower = (chunk_text or "").lower()
+    
+    # Engine-related procedures
+    if any(marker in text_lower for marker in ["engine removal", "removing and installing the engine", "engine assembly removal", "removing the engine", "engine removed by"]):
+        return "engine_removal"
+    
+    # Cooling system procedures
+    if any(marker in text_lower for marker in ["coolant circuit bleeding", "bleeding the cooling system", "cooling circuit bleeding", "cooling system coolant", "coolant bleeding procedure", "bleeding procedure"]):
+        return "coolant_bleeding"
+    
+    if "cooling system" in text_lower and ("tester" in text_lower or "checking for leaks" in text_lower):
+        return "cooling_system_tester"
+    
+    if "cooling system" in text_lower and "antifreeze" in text_lower:
+        return "cooling_system"
+    
+    # Transmission/drivetrain
+    if "transmission" in text_lower and any(marker in text_lower for marker in ["fluid", "drain", "fill", "service"]):
+        return "transmission_service"
+    
+    # Brake system
+    if any(marker in text_lower for marker in ["parking brake", "brake adjustment", "brake service"]):
+        return "brake_system"
+    
+    # Fuel system
+    if "fuel" in text_lower and ("pressure" in text_lower or "system" in text_lower):
+        return "fuel_system"
+    
+    # Radiator
+    if "radiator" in text_lower:
+        return "radiator"
+    
+    # Diagnostic procedures
+    if any(marker in text_lower for marker in ["diagnostic procedure", "diagnostic path", "menu path", "control unit"]):
+        return "diagnostic_procedure"
+    
+    return "unknown"
+
+
+def _extract_section_headers(chunk_text: str) -> List[str]:
+    """Extract section/procedure headers to identify procedure boundaries."""
+    headers = []
+    lines = (chunk_text or "").splitlines()
+    
+    for line in lines:
+        lowered = line.lower().strip()
+        
+        # Section markers that indicate procedure boundaries
+        if any(lowered.startswith(marker) for marker in [
+            "removing and installing",
+            "installation",
+            "removal",
+            "inspection and repair",
+            "check and setting",
+            "service procedure",
+            "procedure:",
+            "diagnostic path:",
+            "menu path:",
+        ]):
+            headers.append(line.strip())
+    
+    return headers
+
+
+def _is_same_procedure(chunk1_text: str, chunk2_text: str) -> bool:
+    """Check if two chunks appear to be from the same procedure/section."""
+    proc1 = _detect_procedure_section(chunk1_text)
+    proc2 = _detect_procedure_section(chunk2_text)
+    
+    if proc1 == "unknown" or proc2 == "unknown":
+        return True  # Don't filter if uncertain
+    
+    return proc1 == proc2
+
+
+def _filter_subject_evidence(question: str, docs):
+    """
+    Prevent unrelated maintenance warnings/procedures from becoming answer evidence.
+    
+    Filters by:
+    1. Engine removal questions: only engine removal procedure evidence
+    2. All questions: prevent mixing evidence from different procedures
+    """
+    if not docs:
+        return docs
+    
+    # First, handle engine removal filtering
+    if _is_engine_removal_question(question):
+        direct_docs = []
+        for doc in docs:
+            content = (getattr(doc, "page_content", "") or "").lower()
+            has_engine_removal_signal = (
+                ("engine/transmission assembly" in content and any(term in content for term in ["lower", "guide", "remove"]))
+                or "lowering the engine" in content
+                or "engine removed by" in content
+                or "engine removal procedure" in content
+            )
+            if has_engine_removal_signal:
+                direct_docs.append(doc)
+        
+        if direct_docs:
+            return direct_docs
+    
+    # General procedure consistency filtering
+    if len(docs) <= 1:
+        return docs
+    
+    # Keep top chunk and filter secondaries to same procedure
+    top_doc = docs[0]
+    top_text = getattr(top_doc, "page_content", "") or ""
+    
+    filtered = [top_doc]
+    for doc in docs[1:]:
+        doc_text = getattr(doc, "page_content", "") or ""
+        if _is_same_procedure(top_text, doc_text):
+            filtered.append(doc)
+    
+    return filtered if filtered else docs
 
 
 def is_context_relevant(question, docs):
@@ -1087,6 +2323,22 @@ def is_reasoning_question(question):
         "why",
         "reason",
         "purpose",
+        "cause",
+        "causes",
+        "consequence",
+        "consequences",
+        "outcome",
+        "outcomes",
+        "effect",
+        "effects",
+        "risk",
+        "risks",
+        "benefit",
+        "benefits",
+        "drawback",
+        "drawbacks",
+        "problem",
+        "problems",
         "what is the reason",
         "why is it",
         "why is this",
@@ -1095,31 +2347,151 @@ def is_reasoning_question(question):
         "what is the purpose",
         "explain why",
         "can you explain why",
+        "what happens if",
+        "what if",
+        "what could happen",
+        "what might happen",
+        "what are the consequences",
+        "what is the risk",
+        "what problems can occur",
+        "what effect does this have",
+        "what effect would this have",
     ]
     return any(marker in q for marker in reasoning_markers)
+
+
+def _is_explanatory_question(question: str) -> bool:
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+    if is_reasoning_question(q):
+        return True
+    markers = [
+        "why not",
+        "how come",
+        "what happens if",
+        "what if",
+        "what could happen",
+        "what might happen",
+        "what are the consequences",
+        "what is the risk",
+        "what problems can occur",
+        "what effect does this have",
+        "what effect would this have",
+        "cause",
+        "causes",
+        "risk",
+        "consequence",
+        "consequences",
+        "effect",
+        "effects",
+        "benefit",
+        "benefits",
+        "drawback",
+        "drawbacks",
+    ]
+    return any(marker in q for marker in markers)
+
+
+def is_equipment_question(question, history=None):
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+
+    direct_markers = [
+        "equipment",
+        "tool",
+        "tools",
+        "special tool",
+        "workshop equipment",
+    ]
+    requirement_markers = ["required", "require", "needed", "need"]
+
+    if any(marker in q for marker in direct_markers):
+        return True
+
+    # Short follow-ups should inherit intent from previous tool/equipment answers.
+    if history and len(q.split()) <= 6 and any(marker in q for marker in ["what", "which", "list"]):
+        history_text = " ".join((turn.get("content") or "") for turn in history[-4:]).lower()
+        if any(marker in history_text for marker in direct_markers):
+            return True
+
+    return any(marker in q for marker in requirement_markers) and any(marker in q for marker in ["equipment", "tools"])
+
+
+def _clean_equipment_line(line):
+    cleaned = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", (line or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" :-")
+
+
+def extract_equipment_from_context(context, max_items=12):
+    if not context:
+        return []
+
+    id_pattern = re.compile(r"\b(?:VAS|VAG)\s*[-: ]?\d{2,6}[A-Z0-9-]*\b|\bT\d{3,6}[A-Z0-9-]*\b", re.IGNORECASE)
+    keyword_pattern = re.compile(
+        r"\b(special tool|workshop equipment|engine support|engine crane|hoist|lifting|adapter|fixture|mount|holder|puller|wrench|socket|tester|diagnostic tester)\b",
+        re.IGNORECASE,
+    )
+
+    generic_phrases = {
+        "special tools and workshop equipment",
+        "special tools and workshop equipment required",
+        "special tools required",
+        "workshop equipment required",
+    }
+
+    items = []
+    seen = set()
+
+    for raw_line in context.splitlines():
+        line = _clean_equipment_line(raw_line)
+        if not line:
+            continue
+        if line.lower().startswith("retrieved evidence"):
+            continue
+        if len(line) < 8:
+            continue
+
+        lower = line.lower()
+        if lower in generic_phrases:
+            continue
+
+        if not (id_pattern.search(line) or keyword_pattern.search(line)):
+            continue
+
+        normalized = lower
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(line)
+
+        if len(items) >= max_items:
+            break
+
+    return items
+
+
+def build_equipment_answer(question, context, history=None):
+    if not is_equipment_question(question, history=history):
+        return None
+
+    equipment_items = extract_equipment_from_context(context)
+    if not equipment_items:
+        return None
+
+    bullets = "\n".join([f"- {item}" for item in equipment_items])
+    return "Required Tools:\n" + bullets
 
 
 def _extract_reason_from_context(context):
     if not context:
         return None
 
-    lowered = (context or "").lower()
-    reason_phrases = [
-        "reason",
-        "because",
-        "to allow",
-        "to avoid",
-        "to reduce",
-        "to enable",
-        "to facilitate",
-        "so that",
-        "this is done",
-        "the engine is removed",
-    ]
-
-    if any(phrase in lowered for phrase in reason_phrases):
-        return context.strip()
-
+    reasons = _extract_reasoning_evidence("", context).get("reason", [])
+    if reasons:
+        return reasons[0]
     return None
 
 
@@ -1127,30 +2499,10 @@ def validate_reasoning_answer(question, context, answer):
     if not is_reasoning_question(question):
         return answer
 
-    context_lower = (context or "").lower()
-    answer_lower = (answer or "").lower()
-
-    warning_markers = [
-        "warning",
-        "caution",
-        "risk of injury",
-        "injury",
-        "safety",
-        "tool requirement",
-        "must be used",
-        "do not",
-        "danger",
-        "hazard",
-    ]
-
-    if any(marker in context_lower for marker in warning_markers):
-        if any(marker in answer_lower for marker in warning_markers):
-            return "The documentation does not specify the reason."
-
-    if _extract_reason_from_context(context):
-        return answer
-
-    return "The documentation does not specify the reason."
+    strict_answer = build_reasoning_answer_from_evidence(question, context)
+    if not strict_answer:
+        return "The documentation does not explicitly state the reason."
+    return strict_answer
 
 
 def build_answer_prompt(question, context, history=None, top_evidence="", secondary_evidence=""):
@@ -1179,19 +2531,43 @@ CONVERSATION HISTORY
     reasoning_instruction = ""
     if is_reasoning_question(question):
         reasoning_instruction = """
+For WHY questions, distinguish evidence types explicitly: Procedure, Requirement, Warning, Reason, Specification.
 For reasoning questions such as why, provide a documented reason only when the context explicitly states one.
 Do not convert warnings into reasons.
 Do not convert procedures into explanations.
 Do not assume engineering intent unless the documentation explicitly states it.
 If the documentation does not explicitly state a reason, say exactly:
-The documentation does not specify the reason.
+The documentation does not explicitly state the reason.
 Then explain in How We Know that the documentation only states the procedure or requirement.
+"""
+
+    equipment_instruction = ""
+    if is_equipment_question(question, history=history):
+        equipment_instruction = """
+For equipment/tool questions, do not answer generically.
+List the exact equipment names and tool IDs exactly as they appear in the Context.
+If no specific equipment names are present, explicitly state that the Context does not list specific equipment names.
+"""
+
+    list_instruction = ""
+    if _is_list_question(question):
+        list_instruction = """
+This is a list-style question about prerequisites, conditions, or requirements.
+Return ALL matching items as a bullet list under a clear heading such as Prerequisites: or Requirements:.
+Do NOT stop after the first matching line.
+Do NOT summarise into a paragraph.
+Preserve each item as a separate bullet point exactly as stated in the Context.
 """
 
     return f"""
 You are GarageGPT, an automotive service manual assistant.
 
-Answer naturally like Microsoft Copilot or ChatGPT while remaining strictly grounded in the retrieved documentation.
+Answer naturally like Microsoft Copilot or ChatGPT.
+
+Priority order:
+1. Retrieved document evidence.
+2. Automotive knowledge.
+3. General knowledge.
 
 Conversation rules:
 - Use previous conversation context when it is relevant.
@@ -1201,20 +2577,22 @@ Conversation rules:
 - If the user asks "why" after a previous answer, explain that previous answer directly and not as a new unrelated topic.
 
 Grounding rules:
-- Use the retrieved documentation as the primary source of truth.
-- Answer only from the provided Context.
+- Use the retrieved documentation as the primary source of truth when it is relevant.
+- If the provided Context answers the question, answer from the Context and rephrase naturally.
 - If Context contains table evidence, use table rows and headers as the primary source over paragraph text.
 - Preserve row-column relationships and header meanings from table evidence.
 - Never invent information that is not supported by the retrieved documentation.
 - Never invent missing table values; if a value is absent, do not fabricate it.
+- For WHY questions, classify evidence as Procedure, Requirement, Warning, Reason, or Specification before answering.
 - Do not convert warnings into reasons.
 - Do not convert procedures into explanations.
 - Do not assume engineering intent unless it is explicitly stated.
 - If the documentation does not explicitly state a reason, say exactly:
-    The documentation does not specify the reason.
-- If the retrieved documentation is insufficient, reply exactly:
-    Answer:
-    I could not find that information in the retrieved documentation.
+    The documentation does not explicitly state the reason.
+- If the Context does not cover the answer and the question is vehicle-related, respond gracefully with:
+        The available document does not provide details on this topic. Based on automotive knowledge, ...
+    Then provide a concise, practical answer.
+- If the question is not vehicle-related, answer using general knowledge.
 
 Response style:
 - Be conversational and helpful.
@@ -1225,28 +2603,26 @@ Response style:
 - If multiple chunks support the answer, summarize them naturally.
 - Use TOP EVIDENCE first.
 - Do not answer from lower-ranked evidence when TOP EVIDENCE already answers the question.
+- Answer only from evidence that directly matches the question subject.
+- Use the highest-ranked matching evidence first.
+- Do not combine information from different procedures unless they answer the same question.
+- If the question asks about a cooling system tester, prefer evidence containing "Cooling System" and "Checking for Leaks".
+- For a cooling system tester question, ignore charge air system procedures, diagnostic procedures, parking brake requirements, and unrelated setup steps.
+- **CRITICAL: If TOP EVIDENCE directly answers the question, use ONLY TOP EVIDENCE. Do not add information from SECONDARY EVIDENCE unless it clarifies or extends the TOP EVIDENCE answer.**
+- **PROCEDURE SEPARATION: Only use SECONDARY EVIDENCE if it is from the same repair procedure as TOP EVIDENCE. If procedures differ, ignore SECONDARY EVIDENCE.**
 - {explanation_guidance}
 - {reasoning_instruction}
+- {list_instruction}
 
 Formatting rules:
-- For normal answers, use this structure:
-    Answer:
-    <one descriptive paragraph that directly answers the question>
-
-    How We Know:
-    • <supporting point>
-    • <supporting point, when useful>
-
-    Additional Information:
-    • <useful related point from the retrieved context>
-- Keep the main Answer as one paragraph, then use bullets for evidence and related information.
-- Do not repeat the same sentence in Answer and How We Know. Paraphrase the answer and use the evidence bullets to support it.
+- Default to a concise natural answer.
+- Include How We Know and Additional Information sections only when the user asks for evidence/reference or when confidence is low.
 - Include only related information that helps answer the question; omit unrelated retrieved instructions.
 - For equipment, tools, specifications, torque values, part numbers, menu paths, or control modules, return a structured list.
 - For table-derived answers, keep values in structured key-value or list form and do not flatten them into free text.
-- For why questions without a documented reason, use:
+- For why questions without a documented reason in Context, use:
     Answer:
-    The documentation does not specify the reason.
+    The documentation does not explicitly state the reason.
 
     How We Know:
     The documentation only describes the procedure or requirement.
@@ -1282,20 +2658,28 @@ def build_verification_prompt(question, context, draft_answer, history=None, top
 Review the draft answer below for grounding, accuracy, and GarageGPT response style.
 
 Rules:
-- Review the draft answer against the provided Context only.
+- Use provided Context first, but allow automotive/general knowledge when Context does not cover the question.
 - Remove any sentence that is not directly supported by the Context.
 - Keep the answer conversational, helpful, and concise.
 - Answer the user's question directly first.
 - Preserve explicit negatives such as cannot be reused, must not be reused, or do not use.
 - If table evidence exists, prefer table values over paragraph text and preserve row-column/header relationships.
 - Never invent missing table values.
+- For WHY questions, explicitly distinguish Procedure, Requirement, Warning, Reason, and Specification evidence.
 - Do not convert warnings into reasons.
 - Do not convert procedures into explanations.
 - If the documentation does not explicitly state a reason, say exactly:
-    The documentation does not specify the reason.
+    The documentation does not explicitly state the reason.
 - Use the chat memory only to resolve follow-up meaning, not to add unsupported facts.
 - Use TOP EVIDENCE first.
 - Do not answer from lower-ranked evidence when TOP EVIDENCE already answers the question.
+- Answer only from evidence that directly matches the question subject.
+- Use the highest-ranked matching evidence first.
+- Do not combine information from different procedures unless they answer the same question.
+- If the question asks about a cooling system tester, prefer evidence containing "Cooling System" and "Checking for Leaks".
+- For a cooling system tester question, ignore charge air system procedures, diagnostic procedures, parking brake requirements, and unrelated setup steps.
+- **CRITICAL: If TOP EVIDENCE directly answers the question, use ONLY TOP EVIDENCE. Do not add information from SECONDARY EVIDENCE unless it clarifies or extends the TOP EVIDENCE answer.**
+- **PROCEDURE SEPARATION: Only use SECONDARY EVIDENCE if it is from the same repair procedure as TOP EVIDENCE. If procedures differ, ignore SECONDARY EVIDENCE.**
 - {explanation_guidance}
 - Keep the final answer in this structure:
     Answer: one descriptive paragraph
@@ -1303,9 +2687,9 @@ Rules:
     Additional Information: concise bullet points when relevant
 - Do not repeat the same sentence in Answer and How We Know.
 - Omit unrelated context instead of adding it as Additional Information.
-- If the Context does not support the answer, reply exactly:
-    Answer:
-    I could not find that information in the retrieved documentation.
+- If Context does not support the answer and the question is vehicle-related, begin with:
+        The available document does not provide details on this topic. Based on automotive knowledge, ...
+    then answer helpfully.
 
 ========================
 CONTEXT
@@ -1348,20 +2732,29 @@ Rules:
 - Use a natural, conversational, helpful tone.
 - Answer directly first.
 - Do not copy large source phrases verbatim.
-- Stay strictly grounded in the Context.
+- Use Context first; if Context does not cover the question, use automotive/general knowledge gracefully.
 - If table evidence exists, keep table-derived values in structured form and preserve header-to-value relationships.
 - Do not add unsupported reasons, explanations, steps, or engineering intent.
 - Never invent missing table values.
+- For WHY questions, explicitly distinguish Procedure, Requirement, Warning, Reason, and Specification evidence.
+- Never convert warning evidence or procedure evidence into a reason.
 - For a follow-up such as why, stay tied to the earlier topic.
 - Use TOP EVIDENCE first.
 - Do not answer from lower-ranked evidence when TOP EVIDENCE already answers the question.
+- Answer only from evidence that directly matches the question subject.
+- Use the highest-ranked matching evidence first.
+- Do not combine information from different procedures unless they answer the same question.
+- If the question asks about a cooling system tester, prefer evidence containing "Cooling System" and "Checking for Leaks".
+- For a cooling system tester question, ignore charge air system procedures, diagnostic procedures, parking brake requirements, and unrelated setup steps.
+- **CRITICAL: If TOP EVIDENCE directly answers the question, use ONLY TOP EVIDENCE. Do not add information from SECONDARY EVIDENCE unless it clarifies or extends the TOP EVIDENCE answer.**
+- **PROCEDURE SEPARATION: Only use SECONDARY EVIDENCE if it is from the same repair procedure as TOP EVIDENCE. If procedures differ, ignore SECONDARY EVIDENCE.**
 - {explanation_guidance}
-- Preserve this structure: Answer as one descriptive paragraph, followed by concise bullet points under How We Know and Additional Information when relevant.
+- Default to a concise natural answer.
+- Include How We Know and Additional Information only when the user asks for evidence/reference or confidence is low.
 - Do not repeat the same sentence in Answer and How We Know.
 - Omit unrelated context instead of adding it as Additional Information.
-- If the Context does not support the answer, reply exactly:
-    Answer:
-    I could not find that information in the retrieved documentation.
+- If Context does not support the answer and the question is vehicle-related, begin with:
+    The available document does not provide details on this topic. Based on automotive knowledge, ...
 - If the user asked for equipment, tools, specifications, torque values, part numbers, menu paths, or control modules, format the answer as a structured list under Answer.
 
 ========================
@@ -1394,6 +2787,9 @@ REWRITTEN ANSWER
 
 
 def enforce_grounding_for_negation(question, context, answer):
+    if is_reasoning_question(question):
+        return re.sub(r"\s+", " ", answer or "").strip()
+
     question_lower = (question or "").lower()
     context_lower = (context or "").lower()
     answer_lower = (answer or "").lower()
@@ -1426,24 +2822,134 @@ def ask_question(question, history=None, session_id=None):
         if history is None:
             history = memory.get_messages()
 
-    # ---------- Retrieve ----------
-    retrieval_query = build_retrieval_query(question, history=history)
+    snapshot = _EVIDENCE_SNAPSHOTS.get(_evidence_snapshot_key(session_id, history))
+    if _is_menu_navigation_followup(question):
+        if snapshot and (snapshot.get("evidence") or {}).get("diagnostic_path"):
+            answer = _build_menu_navigation_answer(snapshot, question)
+            menu_path = (snapshot.get("evidence") or {}).get("diagnostic_path") or []
+            snapshot["menu_pointer"] = _menu_pointer_for_question(
+                question,
+                menu_path,
+                int(snapshot.get("menu_pointer", -1)),
+            )
+            _log_routing_decision("AUTOMOTIVE", "FOUND", "DOCUMENT")
+            return {
+                "question": question,
+                "answer": _present_answer(question, answer, confidence="HIGH"),
+                "context": "\n\n".join(snapshot.get("top_chunks", [])),
+                "confidence": "HIGH",
+                "evidence": snapshot.get("evidence", {}),
+                "evidence_ids": snapshot.get("evidence_ids", []),
+            }
+        _log_routing_decision("AUTOMOTIVE", "NOT_FOUND", "AUTOMOTIVE_KNOWLEDGE")
+        return {
+            "question": question,
+            "answer": DIAGNOSTIC_PATH_NOT_FOUND,
+            "context": "",
+            "confidence": "LOW",
+            "evidence": {},
+            "evidence_ids": [],
+        }
+    if _is_evidence_followup(question):
+        if snapshot:
+            answer = _build_evidence_followup_answer(snapshot)
+            _log_routing_decision("AUTOMOTIVE", "FOUND", "DOCUMENT")
+            return {
+                "question": question,
+                "answer": _present_answer(question, answer, confidence="HIGH"),
+                "context": "\n\n".join(snapshot.get("top_chunks", [])),
+                "confidence": "HIGH",
+                "evidence": snapshot.get("evidence", {}),
+                "evidence_ids": snapshot.get("evidence_ids", []),
+            }
+        _log_routing_decision("AUTOMOTIVE", "NOT_FOUND", "AUTOMOTIVE_KNOWLEDGE")
+        return {
+            "question": question,
+            "answer": "I do not have previously cited evidence in this conversation yet.",
+            "context": "",
+            "confidence": "LOW",
+            "evidence": {},
+            "evidence_ids": [],
+        }
+
+    intent = _classify_intent(question, history=history)
+    if intent in {"GREETING", "ACKNOWLEDGEMENT", "THANKS", "FAREWELL"}:
+        answer = _build_conversational_answer(question, intent)
+        _log_intent_route(intent, "LLM")
+        return {
+            "question": question,
+            "answer": _present_answer(question, answer, confidence="HIGH"),
+            "context": "",
+            "confidence": "HIGH",
+            "evidence": {},
+        }
+    if intent == "GENERAL":
+        answer = _build_knowledge_fallback_answer(
+            question,
+            history=history,
+            include_document_preface=False,
+        )
+        _log_intent_route("GENERAL", "LLM")
+        return {
+            "question": question,
+            "answer": _present_answer(question, answer, confidence="MEDIUM"),
+            "context": "",
+            "confidence": "MEDIUM",
+            "evidence": {},
+        }
+
+    query_type = "QUESTION"
     history_retriever = create_history_aware_retriever(retriever, memory_manager=memory)
-    if session_id:
-        docs = history_retriever.retrieve(question, session_id=str(session_id), history=history)
+    question_type, _ = history_retriever.classify_question_type(question)
+    previous_topic = _previous_user_topic(history, question)
+    use_conversation_context = question_type == "Follow-up"
+    effective_history = history if use_conversation_context else None
+
+    # ---------- Retrieve ----------
+    if use_conversation_context:
+        retrieval_query = build_retrieval_query(question, history=history)
+        if session_id:
+            docs = history_retriever.retrieve(question, session_id=str(session_id), history=history)
+        else:
+            docs = history_retriever.retrieve(question, history=history)
     else:
-        docs = history_retriever.retrieve(question, history=history)
-    docs = rerank(retrieval_query, docs, top_k=TOP_K)
+        retrieval_query = (question or "").strip()
+        docs = retriever.invoke(retrieval_query)
+    diagnostic_top_k = max(TOP_K, 16) if _is_diagnostic_path_question(question) else TOP_K
+    docs = rerank(retrieval_query, docs, top_k=diagnostic_top_k)
+    docs = _filter_subject_evidence(question, docs)
+
+    if _is_engine_removal_question(question):
+        direct_query = f"{retrieval_query} lowering engine transmission assembly subframe vehicle removal procedure"
+        direct_docs = _filter_subject_evidence(
+            question,
+            rerank(
+                direct_query,
+                retriever.invoke(direct_query),
+                top_k=diagnostic_top_k if _is_diagnostic_path_question(question) else TOP_K,
+            ),
+        )
+        if direct_docs:
+            retrieval_query = direct_query
+            docs = direct_docs
 
     print("\n================ RETRIEVED CHUNKS ================\n")
 
     relevant_docs = [doc for doc in docs if score_chunk_relevance(retrieval_query, doc) >= 6.0]
 
     if not relevant_docs:
-        secondary_query = build_secondary_retrieval_query(question, history=history)
+        secondary_query = build_secondary_retrieval_query(
+            question,
+            history=history if use_conversation_context else None,
+        )
         if secondary_query != retrieval_query:
             alt_docs = retriever.invoke(secondary_query)
-            alt_docs = rerank(secondary_query, alt_docs, top_k=TOP_K)
+            alt_docs = rerank(
+                secondary_query,
+                alt_docs,
+                top_k=diagnostic_top_k if _is_diagnostic_path_question(question) else TOP_K,
+            )
+            alt_docs = _filter_subject_evidence(question, alt_docs)
             relevant_docs = [doc for doc in alt_docs if score_chunk_relevance(secondary_query, doc) >= 6.0]
             if relevant_docs:
                 docs = alt_docs
@@ -1460,10 +2966,24 @@ def ask_question(question, history=None, session_id=None):
             relevant_docs = [doc for _, doc in scored_docs[: min(3, len(scored_docs))]]
 
     if not relevant_docs:
+        _log_context_decision(
+            question_type,
+            previous_topic,
+            _topic_from_text(question),
+            use_conversation_context,
+        )
+        knowledge_answer = _build_knowledge_fallback_answer(
+            question,
+            history=history,
+            include_document_preface=True,
+        )
+        _log_intent_route("QUESTION", "LLM")
+        _log_routing_decision("AUTOMOTIVE", "NOT_FOUND", "AUTOMOTIVE_KNOWLEDGE")
         return {
             "question": question,
-            "answer": NO_EVIDENCE_ANSWER,
+            "answer": _present_answer(question, knowledge_answer, confidence="LOW"),
             "context": "",
+            "confidence": "LOW",
         }
 
     cleaned_entries = []
@@ -1493,16 +3013,126 @@ def ask_question(question, history=None, session_id=None):
 
     secondary_chunks = [chunk for chunk in cleaned_chunks if chunk != top_chunk]
     secondary_evidence_text = "\n\n".join(secondary_chunks)
+    current_topic = _topic_from_text(top_chunk or context or question)
+
+    if use_conversation_context and previous_topic != "unknown" and current_topic != "unknown" and previous_topic != current_topic:
+        logger.info(
+            "Topic mismatch detected; discarding previous topic context before answer generation. Previous Topic: %s | Current Topic: %s",
+            previous_topic,
+            current_topic,
+        )
+        effective_history = None
+        use_conversation_context = False
+
+    _log_context_decision(
+        question_type,
+        previous_topic,
+        current_topic,
+        use_conversation_context,
+    )
     top_evidence = extract_structured_evidence(question, top_chunk)
     evidence = extract_structured_evidence(question, context)
     answer_confidence = assess_answer_confidence(question, top_chunk, secondary_chunks)
-    extracted_answer = build_extracted_answer(question, top_chunk or context, top_evidence)
 
-    # If evidence directly answers the question, skip LLM generation entirely.
-    if extracted_answer and answer_confidence == "HIGH":
+    if question_type == "Follow-up" and _is_consequence_followup_question(question):
+        knowledge_answer = _build_knowledge_fallback_answer(
+            question,
+            history=history,
+            include_document_preface=True,
+        )
+        _log_routing_decision(
+            "AUTOMOTIVE",
+            "FOUND" if relevant_docs else "NOT_FOUND",
+            "AUTOMOTIVE_KNOWLEDGE",
+        )
         return {
             "question": question,
-            "answer": extracted_answer,
+            "answer": _present_answer(question, knowledge_answer, confidence="LOW"),
+            "context": context,
+            "confidence": "LOW",
+            "evidence": evidence,
+        }
+
+    if _is_diagnostic_path_question(question) and not evidence.get("diagnostic_path"):
+        knowledge_answer = _build_knowledge_fallback_answer(
+            question,
+            history=history,
+            include_document_preface=True,
+        )
+        _log_intent_route("QUESTION", "LLM")
+        _log_routing_decision("AUTOMOTIVE", "NOT_FOUND", "AUTOMOTIVE_KNOWLEDGE")
+        return {
+            "question": question,
+            "answer": _present_answer(question, knowledge_answer, confidence="LOW"),
+            "context": context,
+            "confidence": "LOW",
+            "evidence": evidence,
+        }
+    
+    # NEW: Try to extract answer from TOP CHUNK ONLY first (prevents mixing procedures)
+    top_chunk_only_answer = extract_answer_from_top_chunk_only(question, top_chunk)
+    if top_chunk_only_answer:
+        if _is_explanatory_question(question):
+            top_chunk_only_answer = None
+        else:
+            _store_evidence_snapshot(
+                session_id,
+                history,
+                question,
+                top_chunk_only_answer,
+                cleaned_entries,
+                top_evidence,
+            )
+            return {
+                "question": question,
+                "answer": _present_answer(question, top_chunk_only_answer, confidence="HIGH"),
+                "context": context,
+                "confidence": "HIGH",
+                "evidence": top_evidence,
+            }
+    
+    extracted_answer = build_extracted_answer(question, top_chunk or context, top_evidence)
+    strict_reasoning_answer = build_reasoning_answer_from_evidence(question, top_chunk or context)
+
+    # If evidence directly answers the question, skip LLM generation entirely.
+    if strict_reasoning_answer:
+        if is_reasoning_question(question):
+            strict_reasoning_answer = _format_reasoning_answer(
+                question,
+                strict_reasoning_answer,
+                top_chunk or context,
+                history=history,
+            )
+        _log_intent_route("QUESTION", "DOCUMENT")
+        _store_evidence_snapshot(
+            session_id,
+            history,
+            question,
+            strict_reasoning_answer,
+            cleaned_entries,
+            top_evidence,
+        )
+        return {
+            "question": question,
+            "answer": _present_answer(question, strict_reasoning_answer, confidence=answer_confidence),
+            "context": context,
+            "confidence": answer_confidence,
+            "evidence": top_evidence,
+        }
+
+    if extracted_answer and answer_confidence == "HIGH":
+        _log_intent_route("QUESTION", "DOCUMENT")
+        _store_evidence_snapshot(
+            session_id,
+            history,
+            question,
+            extracted_answer,
+            cleaned_entries,
+            top_evidence,
+        )
+        return {
+            "question": question,
+            "answer": _present_answer(question, extracted_answer, confidence=answer_confidence),
             "context": context,
             "confidence": answer_confidence,
             "evidence": top_evidence,
@@ -1512,7 +3142,7 @@ def ask_question(question, history=None, session_id=None):
         answer_prompt = build_answer_prompt(
             question,
             context,
-            history=history,
+            history=effective_history,
             top_evidence=top_chunk,
             secondary_evidence=secondary_evidence_text,
         )
@@ -1526,7 +3156,7 @@ def ask_question(question, history=None, session_id=None):
             question,
             context,
             draft_answer,
-            history=history,
+            history=effective_history,
             top_evidence=top_chunk,
             secondary_evidence=secondary_evidence_text,
         )
@@ -1537,7 +3167,7 @@ def ask_question(question, history=None, session_id=None):
             question,
             context,
             verified_answer,
-            history=history,
+            history=effective_history,
             top_evidence=top_chunk,
             secondary_evidence=secondary_evidence_text,
         )
@@ -1545,14 +3175,65 @@ def ask_question(question, history=None, session_id=None):
         final_answer = rewritten_response.content.strip()
         final_answer = enforce_grounding_for_negation(question, context, final_answer)
 
-        if extracted_answer and (
+        if is_reasoning_question(question):
+            strict_or_generated = build_reasoning_answer_from_evidence(question, top_chunk or context) or final_answer
+            final_answer = _format_reasoning_answer(
+                question,
+                strict_or_generated,
+                top_chunk or context,
+                history=history,
+            )
+
+        # NEW: Validate that LLM answer is grounded in top chunk
+        # If not grounded, use extracted answer or fallback
+        if not validate_answer_grounding(question, top_chunk, final_answer):
+            logger.info(
+                "LLM answer not grounded in top chunk; using extracted or fallback answer. "
+                "Question: %s | Answer: %s",
+                question[:100],
+                final_answer[:150],
+            )
+            if extracted_answer:
+                final_answer = extracted_answer
+            else:
+                final_answer = build_evidence_fallback_answer(question, top_chunk or context, top_evidence, top_chunk)
+        elif extracted_answer and (
             answer_confidence == "HIGH" or is_fallback_answer(final_answer)
         ):
             final_answer = extracted_answer
+
+        if is_fallback_answer(final_answer) or "i could not find that information" in final_answer.lower():
+            final_answer = _build_knowledge_fallback_answer(
+                question,
+                history=history,
+                include_document_preface=True,
+            )
     except Exception as exc:
         logger.exception("LLM invocation failed; using evidence-based fallback answer.")
-        final_answer = build_evidence_fallback_answer(question, top_chunk or context, top_evidence, top_chunk)
+        final_answer = _build_knowledge_fallback_answer(
+            question,
+            history=history,
+            include_document_preface=bool(cleaned_chunks),
+        )
 
+    final_answer = _present_answer(question, final_answer, confidence=answer_confidence)
+    _log_intent_route("QUESTION", "LLM" if _is_knowledge_fallback_answer(final_answer) else "DOCUMENT")
+
+    document_match = "FOUND" if answer_confidence in {"HIGH", "MEDIUM"} else "NOT_FOUND"
+    if _is_knowledge_fallback_answer(final_answer):
+        answer_source = "AUTOMOTIVE_KNOWLEDGE"
+    else:
+        answer_source = "DOCUMENT"
+    _log_routing_decision("AUTOMOTIVE", document_match, answer_source)
+
+    _store_evidence_snapshot(
+        session_id,
+        history,
+        question,
+        final_answer,
+        cleaned_entries,
+        top_evidence,
+    )
     return {
         "question": question,
         "answer": final_answer,

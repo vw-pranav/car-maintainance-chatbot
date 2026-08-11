@@ -158,6 +158,56 @@ class SparseRetriever:
 
         return documents
 
+    def expand_neighbors(self, documents: List[Document], radius: int = 2) -> List[Document]:
+        """Return nearby indexed chunks for a hit that may continue across pages."""
+        neighbor_ids = set()
+        for document in documents:
+            metadata = getattr(document, "metadata", {}) or {}
+            try:
+                doc_id = int(metadata.get("doc_id"))
+            except (TypeError, ValueError):
+                continue
+            for offset in range(-radius, radius + 1):
+                if offset:
+                    neighbor_ids.add(doc_id + offset)
+
+        if not neighbor_ids or not self._has_docs_table():
+            return []
+
+        placeholders = ",".join("?" for _ in neighbor_ids)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                f"SELECT doc_id, text, doc_type, source, page, metadata FROM docs "
+                f"WHERE CAST(doc_id AS INTEGER) IN ({placeholders})",
+                tuple(sorted(neighbor_ids)),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        expanded = []
+        for doc_id, text, doc_type, source, page, metadata_json in rows:
+            parsed_metadata = {}
+            if metadata_json:
+                try:
+                    parsed_metadata = json.loads(metadata_json)
+                except json.JSONDecodeError:
+                    parsed_metadata = {}
+            expanded.append(
+                Document(
+                    page_content=text,
+                    metadata={
+                        **parsed_metadata,
+                        "doc_id": doc_id,
+                        "doc_type": doc_type or parsed_metadata.get("doc_type", "text"),
+                        "source": source or parsed_metadata.get("source", ""),
+                        "page": page if page is not None else parsed_metadata.get("page"),
+                        "retrieval_source": "sparse-neighbor",
+                    },
+                )
+            )
+        return expanded
+
 
 def create_sparse_index(documents: List[Document], db_path: Path = SQL_FILE):
     if db_path.exists():

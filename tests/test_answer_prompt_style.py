@@ -90,8 +90,8 @@ class AnswerPromptStyleTests(unittest.TestCase):
 
         self.assertIn("Answer:", prompt)
         self.assertIn("How We Know:", prompt)
-        self.assertIn("Additional Information:", prompt)
-        self.assertIn("I could not find that information in the retrieved documentation.", prompt)
+        self.assertIn("Include How We Know and Additional Information sections only", prompt)
+        self.assertIn("The available document does not provide details on this topic. Based on automotive knowledge", prompt)
 
     def test_prompt_tells_model_to_explain_previous_answer_for_why_followups(self):
         prompt = build_answer_prompt(
@@ -105,6 +105,15 @@ class AnswerPromptStyleTests(unittest.TestCase):
 
         self.assertIn("If the user asks \"why\" after a previous answer", prompt)
         self.assertIn("not as a new unrelated topic", prompt)
+
+    def test_prompt_requires_evidence_type_distinction_for_why(self):
+        prompt = build_answer_prompt(
+            "Why is the engine removed this way?",
+            "Lower the engine/transmission assembly with the subframe.",
+        )
+
+        self.assertIn("Procedure, Requirement, Warning, Reason, Specification", prompt)
+        self.assertIn("The documentation does not explicitly state the reason.", prompt)
 
 
 if __name__ == "__main__":

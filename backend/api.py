@@ -60,6 +60,13 @@ class SessionMessage(BaseModel):
     timestamp: str
 
 
+class SessionCreateResponse(BaseModel):
+    id: int
+    title: str
+    created_at: str
+    updated_at: str
+
+
 def _session_history_payload(limit: int = 20) -> list[dict]:
     sessions = history_store.get_recent_sessions(limit=limit)
     items = []
@@ -105,7 +112,8 @@ def _documents_payload() -> list[dict]:
 
 
 def get_backend_answer(message: str, session_id: int) -> dict:
-    result = ask_question(message)
+    session_history = history_store.get_session_messages(session_id)
+    result = ask_question(message, history=session_history, session_id=session_id)
     return {
         "question": result.get("question", message),
         "answer": result.get("answer", ""),
@@ -142,6 +150,15 @@ def chat(request: ChatRequest):
 def get_history(limit: int = 20):
     safe_limit = max(1, min(limit, 100))
     return {"items": _session_history_payload(limit=safe_limit), "limit": safe_limit}
+
+
+@app.post("/api/history/session", response_model=SessionCreateResponse)
+def create_history_session(title: str = "New conversation"):
+    session_id = history_store.create_session(title)
+    session = history_store.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=500, detail="failed to create session")
+    return session
 
 
 @app.get("/api/history/{session_id}/messages")

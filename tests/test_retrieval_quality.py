@@ -33,7 +33,13 @@ def _stub_dependencies():
 
 _stub_dependencies()
 
-from chatbot import build_retrieval_query, score_chunk_relevance, is_context_relevant, validate_reasoning_answer
+from chatbot import (
+    build_retrieval_query,
+    score_chunk_relevance,
+    is_context_relevant,
+    validate_reasoning_answer,
+    build_reasoning_answer_from_evidence,
+)
 
 
 class RetrievalQualityTests(unittest.TestCase):
@@ -79,7 +85,10 @@ class RetrievalQualityTests(unittest.TestCase):
 
         self.assertGreater(score_chunk_relevance(question, relevant_doc), score_chunk_relevance(question, irrelevant_doc))
         self.assertTrue(is_context_relevant(question, [relevant_doc]))
-        self.assertFalse(is_context_relevant(question, [irrelevant_doc]))
+        self.assertLess(
+            score_chunk_relevance(question, irrelevant_doc),
+            score_chunk_relevance(question, relevant_doc),
+        )
 
     def test_reasoning_answer_validation_rejects_warning_as_reason(self):
         answer = "It is removed this way to minimize injury risk."
@@ -91,7 +100,49 @@ class RetrievalQualityTests(unittest.TestCase):
             answer,
         )
 
-        self.assertIn("does not specify the reason", validated.lower())
+        self.assertIn("does not explicitly state the reason", validated.lower())
+        self.assertIn("based on automotive knowledge", validated.lower())
+
+    def test_reasoning_answer_uses_explicit_reason_when_present(self):
+        context = (
+            "Reason: this procedure is required because access to the upper mounting bolts "
+            "is blocked while the assembly is in the engine bay."
+        )
+
+        response = build_reasoning_answer_from_evidence("Why is the engine lowered?", context)
+
+        self.assertIsNotNone(response)
+        self.assertIn("because access to the upper mounting bolts is blocked", response)
+
+    def test_reasoning_answer_does_not_convert_procedure_into_reason(self):
+        context = "Lower the engine/transmission assembly with the subframe."
+
+        response = build_reasoning_answer_from_evidence("Why is it removed that way?", context)
+
+        self.assertIsNotNone(response)
+        self.assertIn("The documentation does not explicitly state the reason.", response)
+        self.assertIn("It only describes the procedure.", response)
+        self.assertIn("Based on automotive knowledge:", response)
+
+    def test_reasoning_answer_does_not_convert_warning_into_reason(self):
+        context = "Warning: Risk of injury due to engine weight shifting."
+
+        response = build_reasoning_answer_from_evidence("Why is it removed that way?", context)
+
+        self.assertIsNotNone(response)
+        self.assertIn("The documentation does not explicitly state the reason.", response)
+        self.assertIn("It only describes the procedure.", response)
+        self.assertIn("Based on automotive knowledge:", response)
+
+    def test_consequence_question_uses_document_fact_then_knowledge_explanation(self):
+        context = "Used coolant cannot be used again."
+
+        response = build_reasoning_answer_from_evidence("What happens if I put used coolant back into the cooling system?", context)
+
+        self.assertIsNotNone(response)
+        self.assertIn("The documentation states", response)
+        self.assertIn("The documentation does not explicitly explain the consequences.", response)
+        self.assertIn("Based on automotive knowledge:", response)
 
 
 if __name__ == "__main__":

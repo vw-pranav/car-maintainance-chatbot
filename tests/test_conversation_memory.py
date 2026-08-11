@@ -16,6 +16,11 @@ def _rewrite(question, history):
     return retriever.rewrite_query(question, history=history)
 
 
+def _classify(question):
+    retriever = create_history_aware_retriever(DummyRetriever())
+    return retriever.classify_question_type(question)[0]
+
+
 def test_threaded_memory_keeps_previous_turns():
     memory = ThreadedConversationMemory(session_id="thread-1")
     memory.add_user_message("Can used coolant be reused?")
@@ -133,6 +138,37 @@ def test_standalone_engine_removal_question_does_not_use_coolant_context():
     assert rewritten == "For the EA839 engine, how is the engine removed from the vehicle?"
     assert "coolant" not in rewritten.lower()
     assert "regarding" not in rewritten.lower()
+
+
+def test_standalone_questions_are_classified_without_previous_topic():
+    assert _classify("How is the engine removed?") == "Standalone"
+    assert _classify("What is the cooling system tester used for?") == "Standalone"
+    assert _classify("How is fuel pressure reduced?") == "Standalone"
+    assert _classify("What equipment is required for engine removal?") == "Standalone"
+
+
+def test_context_dependent_questions_are_classified_as_followups():
+    assert _classify("Why?") == "Follow-up"
+    assert _classify("How?") == "Follow-up"
+    assert _classify("What about the radiator?") == "Follow-up"
+    assert _classify("What equipment is required?") == "Follow-up"
+    assert _classify("Can it be reused?") == "Follow-up"
+    assert _classify("How do we know?") == "Follow-up"
+
+
+def test_coolant_to_engine_standalone_question_keeps_engine_query_only():
+    history = [
+        {"role": "user", "content": "Can used coolant be reused?"},
+        {"role": "assistant", "content": "Used coolant cannot be reused."},
+    ]
+
+    question = "For the EA839 engine, how is the engine removed from the vehicle?"
+    assert _classify(question) == "Standalone"
+    rewritten = _rewrite(question, history)
+
+    assert rewritten == question
+    assert "engine" in rewritten.lower()
+    assert "coolant" not in rewritten.lower()
 
 
 def test_followup_why_uses_engine_removal_context():

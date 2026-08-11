@@ -140,6 +140,7 @@ class HistoryAwareRetriever:
         "replace": ["replace", "replaced", "replacement"],
         "separate": ["separate", "separated", "separation"],
         "drain": ["drain", "drained", "draining"],
+        "reduce": ["reduce", "reduced", "reducing"],
         "reuse": ["reuse", "reused", "reusable"],
         "use": ["use", "used", "required"],
     }
@@ -171,6 +172,12 @@ class HistoryAwareRetriever:
             "radiator",
             "transmission",
             "subframe",
+            "fuel",
+            "pressure",
+            "cooling",
+            "tester",
+            "leaks",
+            "leak",
             "turbocharger",
             "control",
             "system",
@@ -260,6 +267,10 @@ class HistoryAwareRetriever:
         question_type, _ = self._classify_question_type(q)
         return question_type == "Follow-up"
 
+    def classify_question_type(self, question: str) -> tuple[str, str]:
+        """Classify the current message without applying conversation rewriting."""
+        return self._classify_question_type(question)
+
     def _detect_intent(self, question: str) -> str:
         q = (question or "").strip().lower()
         if not q:
@@ -329,6 +340,7 @@ class HistoryAwareRetriever:
             "replace": "replaced",
             "separate": "separated",
             "drain": "drained",
+            "reduce": "reduced",
             "reuse": "reused",
             "use": "used",
             "inspect": "checked",
@@ -342,6 +354,7 @@ class HistoryAwareRetriever:
             "replace": "replace",
             "separate": "separate",
             "drain": "drain",
+            "reduce": "reduce",
             "reuse": "reuse",
             "use": "use",
             "inspect": "check",
@@ -633,6 +646,14 @@ class HistoryAwareRetriever:
             history = memory.get_recent_messages(limit=12) if memory else []
 
         question_type, reason = self._classify_question_type(q)
+        if question_type == "Standalone":
+            if session_id:
+                self._last_retrieval_query_by_session[str(session_id)] = q
+            logger.info(
+                "Question Type: Standalone | Previous Topic: isolated | Current Topic: current question | Context Used: No"
+            )
+            return q
+
         context = self._build_context_bundle(q, history or [], session_id=session_id)
         rewritten = self.generate_standalone_question(q, history or [], session_id=session_id)
 
