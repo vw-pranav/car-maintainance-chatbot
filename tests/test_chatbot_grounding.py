@@ -34,6 +34,9 @@ from chatbot import (
     _format_reasoning_answer,
     _is_consequence_followup_question,
     _build_pressure_relief_specification_answer,
+    _is_explanation_followup_question,
+    _answer_contradicts_document,
+    _build_consequence_answer_from_context,
     ask_question,
 )
 
@@ -163,6 +166,62 @@ class ChatbotGroundingTests(unittest.TestCase):
         self.assertTrue(_is_consequence_followup_question("What happens if I use it anyway?"))
         self.assertTrue(_is_consequence_followup_question("What would happen if I put used coolant back?"))
         self.assertFalse(_is_consequence_followup_question("Can used coolant be reused?"))
+
+    def test_explanation_followup_detection_uses_short_contextual_prompts(self):
+        history = [{"role": "user", "content": "What should be done before opening a pressurized cooling system?"}]
+        self.assertTrue(_is_explanation_followup_question("Why?", history=history))
+        self.assertTrue(_is_explanation_followup_question("What happens if I use it again?", history=history))
+        self.assertFalse(_is_explanation_followup_question("Hello", history=history))
+
+    def test_contradiction_detector_blocks_reuse_positive_claims(self):
+        context = "Used coolant cannot be used again."
+        self.assertTrue(_answer_contradicts_document(context, "It continues to work as expected if reused."))
+        self.assertFalse(_answer_contradicts_document(context, "It should not be reused."))
+
+    def test_consequence_answer_from_context_preserves_document_fact(self):
+        question = "What happens if I use it again?"
+        context = "Used coolant cannot be used again."
+
+        answer = _build_consequence_answer_from_context(question, context)
+
+        self.assertIn("The documentation states", answer)
+        self.assertIn("cannot be used again", answer)
+        self.assertIn("does not explicitly explain the consequences", answer)
+        self.assertIn("Based on automotive knowledge:", answer)
+
+    def test_why_followup_uses_active_snapshot_context(self):
+        chatbot_mod = __import__("chatbot")
+
+        class FailRetriever:
+            def invoke(self, query):
+                raise AssertionError("retrieval should not be called when snapshot already provides follow-up context")
+
+        history = [
+            {"role": "user", "content": "What should be done before opening a pressurized cooling system?"},
+            {"role": "assistant", "content": "Reduce pressure by covering cap with a cloth and carefully opening it."},
+        ]
+        key = chatbot_mod._evidence_snapshot_key(session_id=404, history=history)
+        chatbot_mod._EVIDENCE_SNAPSHOTS[key] = {
+            "question": history[0]["content"],
+            "answer": history[1]["content"],
+            "top_chunks": [
+                "The cooling system is under pressure when warm. Reduce pressure by covering the coolant expansion tank cap with a cloth and carefully opening it."
+            ],
+            "evidence_ids": ["enginepdf2.pdf:page-12"],
+            "evidence": {},
+            "menu_pointer": -1,
+        }
+
+        original_retriever = chatbot_mod.retriever
+        try:
+            chatbot_mod.retriever = FailRetriever()
+            result = ask_question("Why?", history=history, session_id=404)
+            self.assertIn("documentation", result["answer"].lower())
+            self.assertIn("pressure", result["context"].lower())
+            self.assertEqual(result["confidence"], "HIGH")
+        finally:
+            chatbot_mod.retriever = original_retriever
+            chatbot_mod._EVIDENCE_SNAPSHOTS.pop(key, None)
 
     def test_automotive_fallback_prompt_uses_required_preface(self):
         prompt = _build_knowledge_fallback_prompt(

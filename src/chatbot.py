@@ -530,6 +530,83 @@ def _is_consequence_followup_question(question: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in consequence_patterns)
 
 
+def _is_explanation_followup_question(question: str, history: List[Dict[str, Any]] | None = None) -> bool:
+    if not _is_explanatory_question(question):
+        return False
+    if _is_followup_question(question, history=history):
+        return True
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    return any(marker in lowered for marker in [" what if", "what happens if", "consequence", "risk", "effects", "why"])
+
+
+def _extract_document_negation_facts(context: str) -> Dict[str, bool]:
+    lowered = (context or "").lower()
+    return {
+        "coolant_no_reuse": any(
+            marker in lowered
+            for marker in [
+                "used coolant cannot be used again",
+                "used coolant cannot be reused",
+                "coolant cannot be reused",
+                "must not be reused",
+                "do not reuse",
+            ]
+        )
+    }
+
+
+def _answer_contradicts_document(context: str, answer: str) -> bool:
+    lowered_answer = (answer or "").lower()
+    facts = _extract_document_negation_facts(context)
+
+    if facts.get("coolant_no_reuse"):
+        contradiction_markers = [
+            "works as expected",
+            "continues to work",
+            "safe to reuse",
+            "can be reused",
+            "can use it again",
+            "it is okay to reuse",
+            "no problem reusing",
+        ]
+        if any(marker in lowered_answer for marker in contradiction_markers):
+            return True
+        if "yes" in lowered_answer and any(marker in lowered_answer for marker in ["reuse", "used coolant"]):
+            return True
+
+    return False
+
+
+def _build_consequence_answer_from_context(
+    question: str,
+    context: str,
+    history: List[Dict[str, Any]] | None = None,
+) -> str:
+    evidence = _extract_reasoning_evidence(question, context)
+    support_line = (
+        (evidence.get("requirement") or [None])[0]
+        or (evidence.get("warning") or [None])[0]
+        or (evidence.get("procedure") or [None])[0]
+        or _top_evidence_line(context, question)
+        or "the retrieved documentation"
+    )
+    support_line = support_line.strip().rstrip(".")
+
+    explanation = _build_automotive_why_explanation(question, context, history=history)
+    if _answer_contradicts_document(context, explanation):
+        explanation = (
+            "Reused coolant may contain contaminants, degraded additives, or corrosion particles "
+            "that can reduce cooling-system protection and performance."
+        )
+
+    return (
+        f"The documentation states that {support_line}.\n\n"
+        "The documentation does not explicitly explain the consequences.\n\n"
+        "Based on automotive knowledge:\n"
+        f"{explanation}"
+    )
+
+
 def _build_smalltalk_answer(question: str) -> str:
     prompt = f"""
 You are GarageGPT.
@@ -937,7 +1014,13 @@ Explanation:
 """
     try:
         response = _invoke_llm(prompt, stage="why_automotive_knowledge")
-        return re.sub(r"\s+", " ", (response.content or "")).strip().strip('"')
+        explanation = re.sub(r"\s+", " ", (response.content or "")).strip().strip('"')
+        if _answer_contradicts_document(context, explanation):
+            return (
+                "Reused coolant may contain contaminants, degraded additives, or corrosion particles "
+                "that can reduce cooling-system protection and performance."
+            )
+        return explanation
     except Exception:
         return (
             "Automotive systems often specify this to prevent component damage, "
@@ -3039,6 +3122,26 @@ def ask_question(question, history=None, session_id=None):
             "evidence_ids": [],
         }
 
+    if snapshot and _is_explanation_followup_question(question, history=history):
+        snapshot_context = "\n\n".join(snapshot.get("top_chunks", []))
+        if _is_consequence_followup_question(question):
+            answer = _build_consequence_answer_from_context(question, snapshot_context, history=history)
+        else:
+            answer = build_reasoning_answer_from_evidence(question, snapshot_context) or _build_consequence_answer_from_context(
+                question,
+                snapshot_context,
+                history=history,
+            )
+        _log_routing_decision("AUTOMOTIVE", "FOUND", "DOCUMENT")
+        return {
+            "question": question,
+            "answer": _present_answer(question, answer, confidence="HIGH"),
+            "context": snapshot_context,
+            "confidence": "HIGH",
+            "evidence": snapshot.get("evidence", {}),
+            "evidence_ids": snapshot.get("evidence_ids", []),
+        }
+
     intent = _classify_intent(question, history=history)
     if intent in {"GREETING", "ACKNOWLEDGEMENT", "THANKS", "FAREWELL"}:
         answer = _build_conversational_answer(question, intent)
@@ -3257,21 +3360,17 @@ def ask_question(question, history=None, session_id=None):
         }
 
     if question_type == "Follow-up" and _is_consequence_followup_question(question):
-        knowledge_answer = _build_knowledge_fallback_answer(
-            question,
-            history=history,
-            include_document_preface=True,
-        )
+        consequence_answer = _build_consequence_answer_from_context(question, top_chunk or context, history=history)
         _log_routing_decision(
             "AUTOMOTIVE",
             "FOUND" if relevant_docs else "NOT_FOUND",
-            "AUTOMOTIVE_KNOWLEDGE",
+            "DOCUMENT",
         )
         return {
             "question": question,
-            "answer": _present_answer(question, knowledge_answer, confidence="LOW"),
+            "answer": _present_answer(question, consequence_answer, confidence="HIGH"),
             "context": context,
-            "confidence": "LOW",
+            "confidence": "HIGH",
             "evidence": evidence,
         }
 
@@ -3396,6 +3495,10 @@ def ask_question(question, history=None, session_id=None):
         rewritten_response = _invoke_llm(rewrite_prompt, stage="rewrite")
         final_answer = rewritten_response.content.strip()
         final_answer = enforce_grounding_for_negation(question, context, final_answer)
+
+        if _answer_contradicts_document(top_chunk or context, final_answer):
+            logger.info("Generated answer contradicted documented fact; regenerating deterministic consequence response.")
+            final_answer = _build_consequence_answer_from_context(question, top_chunk or context, history=history)
 
         if is_reasoning_question(question):
             strict_or_generated = build_reasoning_answer_from_evidence(question, top_chunk or context) or final_answer
