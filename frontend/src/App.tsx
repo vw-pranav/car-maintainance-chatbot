@@ -29,7 +29,9 @@ type Message = {
 };
 
 const assistantWelcomeText =
-  "Welcome to GarageGPT! I'm your intelligent document assistant for all things automotive. Upload your service records, repair invoices, or maintenance logs, and I can help you analyze, summarize, and answer questions about your garage history. What would you like to know?";
+  "Hi there. What can I help you with today?";
+
+const assistantLoadingText = 'Thinking...';
 
 const IST_TIMEZONE = 'Asia/Kolkata';
 const IST_LOCALE = 'en-IN';
@@ -108,6 +110,7 @@ function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState('');
   const [activeSessionId, setActiveSessionId] = useState<number | undefined>(undefined);
+  const [hasChatActivity, setHasChatActivity] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const refreshSidebarData = async () => {
@@ -154,6 +157,7 @@ function App() {
     setInputValue('');
     setError('');
     setIsLoading(true);
+    setHasChatActivity(true);
 
     try {
       const response = await sendChatMessage(trimmed, activeSessionId);
@@ -177,6 +181,7 @@ function App() {
         const session = await createHistorySession();
         setActiveSessionId(session.id);
         setMessages([makeMessage('assistant', assistantWelcomeText)]);
+        setHasChatActivity(false);
         await refreshSidebarData();
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unable to start a new chat.';
@@ -206,6 +211,7 @@ function App() {
       for (const file of Array.from(fileList)) {
         await uploadDocument(file, activeSessionId);
       }
+      setHasChatActivity(true);
       await refreshSidebarData();
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to upload the selected document.';
@@ -224,6 +230,7 @@ function App() {
       if (activeSessionId === sessionId) {
         setActiveSessionId(undefined);
         setMessages([makeMessage('assistant', assistantWelcomeText)]);
+        setHasChatActivity(false);
       }
       await refreshSidebarData();
     } catch (err) {
@@ -246,6 +253,7 @@ function App() {
         }));
 
       setActiveSessionId(sessionId);
+      setHasChatActivity(restoredMessages.length > 1 || restoredMessages.some((message) => message.role === 'user') || payload.documents.length > 0);
       setMessages(
         restoredMessages.length > 0
           ? restoredMessages
@@ -318,22 +326,9 @@ function App() {
           </GroupuiGlobalSideNavigation>
 
           <div className="sidebar-actions">
-            <GroupuiButton onClick={handleNewChat} className="new-chat-button">
+            <GroupuiButton onClick={handleNewChat} className="new-chat-button" disabled={!hasChatActivity || isLoading || isTyping}>
               New Chat
             </GroupuiButton>
-            <div className="upload-button">
-              <input
-                type="file"
-                ref={fileInputRef}
-                accept="application/pdf,.pdf"
-                multiple
-                hidden
-                onChange={handleFilesSelected}
-              />
-              <GroupuiButton onClick={handleUploadClick} disabled={isUploading}>
-                {isUploading ? 'Uploading...' : 'Upload document'}
-              </GroupuiButton>
-            </div>
           </div>
         </aside>
 
@@ -352,7 +347,7 @@ function App() {
               <div className="message-row assistant">
                 <div className="g-card message-card assistant-thinking-card">
                   <strong className="message-sender">GarageGPT</strong>
-                  <div className="message-content assistant-thinking-text">Analyzing your documents...</div>
+                  <div className="message-content assistant-thinking-text">{assistantLoadingText}</div>
                 </div>
               </div>
             )}
@@ -361,12 +356,23 @@ function App() {
           {error ? <div className="error-banner">{error}</div> : null}
 
           <div className="composer">
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept="application/pdf,.pdf"
+              multiple
+              hidden
+              onChange={handleFilesSelected}
+            />
             <groupui-input
-              placeholder="Ask about your garage documents..."
+              placeholder="Send a message..."
               value={inputValue}
               onInput={(e: any) => setInputValue(e.target.value)}
               onKeyPress={handleKeyPress}
             />
+            <GroupuiButton onClick={handleUploadClick} disabled={isUploading || isLoading || isTyping}>
+              {isUploading ? 'Uploading...' : 'Upload'}
+            </GroupuiButton>
             <GroupuiButton onClick={() => void handleSendMessage()} disabled={isLoading || isTyping}>
               Send
             </GroupuiButton>
