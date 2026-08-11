@@ -33,6 +33,7 @@ from chatbot import (
     build_reasoning_answer_from_evidence,
     _format_reasoning_answer,
     _is_consequence_followup_question,
+    _build_pressure_relief_specification_answer,
     ask_question,
 )
 
@@ -192,7 +193,32 @@ class ChatbotGroundingTests(unittest.TestCase):
             "• Used coolant cannot be reused."
         )
         rendered = _present_answer("How do we know coolant cannot be reused?", raw, confidence="HIGH")
-        self.assertIn("Reference:", rendered)
+        self.assertNotIn("How We Know:", rendered)
+        self.assertNotIn("Reference:", rendered)
+        self.assertIn("Used coolant cannot be reused.", rendered)
+
+    def test_low_confidence_answer_does_not_show_evidence_heading(self):
+        raw = (
+            "Answer:\n"
+            "The cooling system tester is used to check for leaks.\n\n"
+            "How We Know:\n"
+            "• The manual identifies the procedure as checking for leaks."
+        )
+
+        rendered = _present_answer("What is the cooling system tester used to check?", raw, confidence="LOW")
+
+        self.assertEqual(rendered, "The cooling system tester is used to check for leaks.")
+
+    def test_inline_how_we_know_label_is_removed(self):
+        raw = (
+            "Answer: The cooling system tester is used to check for leaks. "
+            "How We Know: Cooling System, Checking for Leaks procedure confirms this."
+        )
+
+        rendered = _present_answer("What is the cooling system tester used to check?", raw, confidence="HIGH")
+
+        self.assertNotIn("How We Know:", rendered)
+        self.assertEqual(rendered, "The cooling system tester is used to check for leaks.")
 
     def test_reasoning_without_explicit_reason_uses_concise_sentence(self):
         response = build_reasoning_answer_from_evidence(
@@ -371,6 +397,27 @@ T10038 Puller
             "The retrieved documentation lists this path: Engine electronics J623 -> Engine electronics functions -> Coolant circuit bleeding procedure",
             answer,
         )
+
+    def test_non_diagnostic_pressure_question_does_not_extract_menu_path(self):
+        question = "At what pressure should the cooling system cap pressure relief valve open?"
+        context = """10 - Restrictor
+11 - Bleed Hole
+18 - ATF Cooler
+Checking the pressure relief valve. Refer to Cooling System, Checking for Leaks."""
+
+        evidence = extract_structured_evidence(question, context)
+
+        self.assertEqual(evidence["diagnostic_path"], [])
+        self.assertNotIn("Use this diagnostic path:", build_extracted_answer(question, context, evidence) or "")
+
+    def test_pressure_question_does_not_invent_missing_value(self):
+        question = "At what pressure should the cooling system cap pressure relief valve open?"
+        context = "Checking the pressure relief valve. Refer to Cooling System, Checking for Leaks."
+
+        answer = _build_pressure_relief_specification_answer(question, context)
+
+        self.assertIn("does not state the pressure", answer)
+        self.assertNotIn("Use this diagnostic path:", answer)
 
     def test_evidence_followup_reuses_previous_diagnostic_path(self):
         snapshot = {

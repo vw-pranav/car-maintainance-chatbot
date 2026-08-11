@@ -592,8 +592,6 @@ def _is_vehicle_question(
 
 def _should_include_evidence_sections(question: str, confidence: str = "HIGH") -> bool:
     lowered = (question or "").lower()
-    if confidence == "LOW":
-        return True
     evidence_markers = [
         "how do we know",
         "what evidence",
@@ -610,7 +608,8 @@ def _strip_optional_evidence_sections(answer: str) -> str:
     text = (answer or "").strip()
     if not text:
         return text
-    text = re.sub(r"\n\nHow We Know:\n[\s\S]*?(?=\n\nAdditional Information:|\Z)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n\nHow\s+We\s+Know:\n[\s\S]*?(?=\n\nAdditional Information:|\Z)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*How\s+We\s+Know:\s*[\s\S]*?(?=\n\nAdditional Information:|\Z)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\n\nAdditional Information:\n[\s\S]*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^Answer:\s*\n", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^Answer:\s*", "", text, flags=re.IGNORECASE)
@@ -624,9 +623,11 @@ def _present_answer(question: str, answer: str, confidence: str = "HIGH") -> str
 
     include_evidence = _should_include_evidence_sections(question, confidence=confidence)
     if include_evidence:
-        text = re.sub(r"\n\nHow We Know:\n", "\n\nReference:\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n\nHow\s+We\s+Know:\n", "\n\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*How\s+We\s+Know:\s*", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"\n\nAdditional Information:\n", "\n\nNotes:\n", text, flags=re.IGNORECASE)
         text = re.sub(r"^Answer:\s*\n", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
     return _strip_optional_evidence_sections(text)
@@ -1185,7 +1186,7 @@ def extract_diagnostic_path(question: str, context: str) -> List[str]:
     """Extract selectable menu nodes while excluding instructional text."""
     question_lower = (question or "").lower()
     structure = extract_menu_structure(context)
-    if not any(term in question_lower for term in _MENU_QUESTION_MARKERS) and not structure["menu_path"]:
+    if not any(term in question_lower for term in _MENU_QUESTION_MARKERS):
         return []
     return structure["menu_path"] if len(structure["menu_path"]) >= 2 else []
 
@@ -1359,6 +1360,43 @@ def extract_specification_list(context: str) -> List[str]:
         if match not in seen:
             seen.append(match)
     return seen
+
+def _is_pressure_relief_specification_question(question: str) -> bool:
+    lowered = (question or "").lower()
+    return (
+        any(term in lowered for term in ["what pressure", "at what pressure", "opening pressure", "open at"])
+        and any(term in lowered for term in ["cooling system", "coolant", "expansion tank", "cap"])
+        and any(term in lowered for term in ["relief valve", "pressure valve", "cap"])
+    )
+
+
+def _build_pressure_relief_specification_answer(question: str, context: str) -> str | None:
+    if not _is_pressure_relief_specification_question(question):
+        return None
+
+    pressure_lines = []
+    for line in _context_lines(context):
+        if re.search(r"\b\d+(?:[.,]\d+)?\s*(?:bar|psi)\b", line, re.IGNORECASE):
+            pressure_lines.append(line)
+
+    if pressure_lines:
+        return _build_structured_response(
+            pressure_lines[0],
+            "The retrieved documentation states this pressure value directly.",
+        )
+
+    reference = next(
+        (
+            line
+            for line in _context_lines(context)
+            if "pressure relief valve" in line.lower() or "checking for leaks" in line.lower()
+        ),
+        "The supplied manual refers to the Cooling System, Checking for Leaks procedure.",
+    )
+    return _build_structured_response(
+        "The supplied EA839 documentation does not state the pressure at which the cooling-system cap relief valve opens.",
+        reference,
+    )
 
 
 def _extract_tool_values_from_table(rows: List[Dict[str, str]]) -> List[str]:
@@ -3143,6 +3181,25 @@ def ask_question(question, history=None, session_id=None):
     top_evidence = extract_structured_evidence(question, top_chunk)
     evidence = extract_structured_evidence(question, context)
     answer_confidence = assess_answer_confidence(question, top_chunk, secondary_chunks)
+
+    pressure_specification_answer = _build_pressure_relief_specification_answer(question, context)
+    if pressure_specification_answer:
+        _log_intent_route("QUESTION", "DOCUMENT")
+        _store_evidence_snapshot(
+            session_id,
+            history,
+            question,
+            pressure_specification_answer,
+            cleaned_entries,
+            top_evidence,
+        )
+        return {
+            "question": question,
+            "answer": _present_answer(question, pressure_specification_answer, confidence="LOW"),
+            "context": context,
+            "confidence": "LOW",
+            "evidence": top_evidence,
+        }
 
     if question_type == "Follow-up" and _is_consequence_followup_question(question):
         knowledge_answer = _build_knowledge_fallback_answer(
