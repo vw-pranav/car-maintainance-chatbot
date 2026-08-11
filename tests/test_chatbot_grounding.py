@@ -49,7 +49,14 @@ class ChatbotGroundingTests(unittest.TestCase):
         )
 
     def test_query_router_classifies_general(self):
-        self.assertEqual(_classify_query_type("What is machine learning?"), "GENERAL")
+        self.assertEqual(_classify_query_type("What is machine learning?"), "GENERAL_KNOWLEDGE")
+
+    def test_query_router_classifies_follow_up(self):
+        history = [
+            {"role": "user", "content": "What is machine learning?"},
+            {"role": "assistant", "content": "Machine learning is a field of AI."},
+        ]
+        self.assertEqual(_classify_query_type("How does it work?", history=history), "FOLLOW_UP")
 
     def test_conversational_intent_classifier_handles_acknowledgements_and_farewells(self):
         self.assertEqual(_classify_intent("okay"), "ACKNOWLEDGEMENT")
@@ -80,6 +87,76 @@ class ChatbotGroundingTests(unittest.TestCase):
         finally:
             __import__("chatbot").retriever = original_retriever
             __import__("chatbot")._invoke_llm = original_invoke_llm
+
+    def test_standalone_general_knowledge_bypasses_retrieval_and_memory(self):
+        class FailRetriever:
+            def invoke(self, query):
+                raise AssertionError("retrieval should not be called for standalone general knowledge")
+
+        captured = {"history": "unset"}
+
+        def fake_general_answer(question, history=None, include_document_preface=False):
+            captured["history"] = history
+            return "Machine learning is a branch of AI focused on learning patterns from data."
+
+        original_retriever = __import__("chatbot").retriever
+        original_fallback = __import__("chatbot")._build_knowledge_fallback_answer
+        try:
+            __import__("chatbot").retriever = FailRetriever()
+            __import__("chatbot")._build_knowledge_fallback_answer = fake_general_answer
+
+            history = [
+                {"role": "user", "content": "Can used coolant be reused?"},
+                {"role": "assistant", "content": "No, used coolant should not be reused."},
+            ]
+
+            with self.assertLogs("chatbot", level="INFO") as logs:
+                result = ask_question("What is machine learning?", history=history, session_id=101)
+
+            self.assertEqual(result["confidence"], "MEDIUM")
+            self.assertIn("Machine learning", result["answer"])
+            self.assertEqual(result["evidence"], {})
+            self.assertIsNone(captured["history"])
+            joined = "\n".join(logs.output)
+            self.assertIn("QueryType: GENERAL_KNOWLEDGE", joined)
+            self.assertIn("MemoryUsed: NO", joined)
+            self.assertIn("RetrieverUsed: NO", joined)
+            self.assertIn("AnswerSource: LLM", joined)
+        finally:
+            __import__("chatbot").retriever = original_retriever
+            __import__("chatbot")._build_knowledge_fallback_answer = original_fallback
+
+    def test_general_followup_uses_general_context_not_retrieval(self):
+        class FailRetriever:
+            def invoke(self, query):
+                raise AssertionError("retrieval should not be called for general follow-up")
+
+        captured = {"history": None}
+
+        def fake_general_answer(question, history=None, include_document_preface=False):
+            captured["history"] = history
+            return "Machine learning works by training models on data and improving predictions over time."
+
+        original_retriever = __import__("chatbot").retriever
+        original_fallback = __import__("chatbot")._build_knowledge_fallback_answer
+        try:
+            __import__("chatbot").retriever = FailRetriever()
+            __import__("chatbot")._build_knowledge_fallback_answer = fake_general_answer
+
+            history = [
+                {"role": "user", "content": "What is machine learning?"},
+                {"role": "assistant", "content": "Machine learning is a field of AI."},
+            ]
+
+            result = ask_question("How does it work?", history=history)
+
+            self.assertEqual(result["confidence"], "MEDIUM")
+            self.assertIn("Machine learning works", result["answer"])
+            self.assertIsNotNone(captured["history"])
+            self.assertGreaterEqual(len(captured["history"]), 2)
+        finally:
+            __import__("chatbot").retriever = original_retriever
+            __import__("chatbot")._build_knowledge_fallback_answer = original_fallback
 
     def test_followup_consequence_detector_matches_if_questions(self):
         self.assertTrue(_is_consequence_followup_question("What happens if I use it anyway?"))

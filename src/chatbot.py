@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 _EVIDENCE_SNAPSHOTS: Dict[str, Dict[str, Any]] = {}
+_ACTIVE_VEHICLE_ENTITY: Dict[str, str | None] = {}
 
 
 TABLE_INTENT_MARKERS = [
@@ -368,6 +369,61 @@ FAREWELL_MARKERS = {
 }
 
 
+GENERAL_KNOWLEDGE_MARKERS = {
+    "machine learning",
+    "artificial intelligence",
+    " ai ",
+    "python",
+    "cloud computing",
+    "database",
+    "data science",
+    "neural network",
+    "programming",
+    "computer science",
+    "algorithm",
+    "api",
+    "web development",
+}
+
+
+def _session_context_key(session_id: Any, history: List[Dict[str, Any]] | None) -> str:
+    if session_id is not None:
+        return f"session:{session_id}"
+    history_text = "\n".join(
+        f"{item.get('role', '')}:{item.get('content', '')}"
+        for item in (history or [])[-6:]
+    )
+    digest = hashlib.sha256(history_text.encode("utf-8")).hexdigest()[:16]
+    return f"history:{digest}"
+
+
+def _reset_vehicle_entity_context(session_id: Any, history: List[Dict[str, Any]] | None) -> None:
+    key = _session_context_key(session_id, history)
+    _ACTIVE_VEHICLE_ENTITY[key] = None
+    _EVIDENCE_SNAPSHOTS.pop(_evidence_snapshot_key(session_id, history), None)
+
+
+def _track_vehicle_entity(question: str, session_id: Any, history: List[Dict[str, Any]] | None) -> None:
+    if not _is_vehicle_question(question, include_history_context=False):
+        return
+    key = _session_context_key(session_id, history)
+    topic = _topic_from_text(question)
+    _ACTIVE_VEHICLE_ENTITY[key] = topic if topic != "unknown" else "vehicle"
+
+
+def _is_general_knowledge_question(question: str) -> bool:
+    normalized = f" {(question or '').strip().lower()} "
+    if not normalized.strip():
+        return False
+    if _is_vehicle_question(question, include_history_context=False):
+        return False
+    if any(marker in normalized for marker in GENERAL_KNOWLEDGE_MARKERS):
+        return True
+    if re.match(r"^\s*(?:what is|what's|explain|define|tell me about)\s+", normalized.strip()):
+        return True
+    return False
+
+
 def _classify_intent(question: str, history: List[Dict[str, Any]] | None = None) -> str:
     normalized = re.sub(r"\s+", " ", (question or "").strip().lower()).strip("?.!")
     if not normalized:
@@ -413,14 +469,18 @@ def _classify_intent(question: str, history: List[Dict[str, Any]] | None = None)
 def _classify_query_type(question: str, history: List[Dict[str, Any]] | None = None) -> str:
     normalized = re.sub(r"\s+", " ", (question or "").strip().lower()).strip("?.!")
     if not normalized:
-        return "GENERAL"
+        return "GENERAL_KNOWLEDGE"
     if normalized in GREETING_MARKERS or any(
         normalized.startswith(marker) for marker in GREETING_MARKERS
     ):
         return "GREETING"
-    if _is_vehicle_question(question, history=history):
+    if _is_followup_question(question, history=history):
+        return "FOLLOW_UP"
+    if _is_vehicle_question(question, include_history_context=False):
         return "AUTOMOTIVE"
-    return "GENERAL"
+    if _is_general_knowledge_question(question):
+        return "GENERAL_KNOWLEDGE"
+    return "GENERAL_KNOWLEDGE"
 
 
 def _log_routing_decision(query_type: str, document_match: str, answer_source: str) -> None:
@@ -434,6 +494,16 @@ def _log_routing_decision(query_type: str, document_match: str, answer_source: s
 
 def _log_intent_route(intent: str, source: str) -> None:
     logger.info("Intent: %s | Source: %s", intent, source)
+
+
+def _log_execution_path(query_type: str, memory_used: bool, retriever_used: bool, answer_source: str) -> None:
+    logger.info(
+        "QueryType: %s | MemoryUsed: %s | RetrieverUsed: %s | AnswerSource: %s",
+        query_type,
+        "YES" if memory_used else "NO",
+        "YES" if retriever_used else "NO",
+        answer_source,
+    )
 
 
 def _is_knowledge_fallback_answer(answer: str) -> bool:
@@ -505,11 +575,15 @@ Assistant:
         return fallback_map.get(intent, fallback_map["GENERAL"])
 
 
-def _is_vehicle_question(question: str, history: List[Dict[str, Any]] | None = None) -> bool:
+def _is_vehicle_question(
+    question: str,
+    history: List[Dict[str, Any]] | None = None,
+    include_history_context: bool = True,
+) -> bool:
     lowered = (question or "").lower()
     if any(marker in lowered for marker in VEHICLE_KNOWLEDGE_MARKERS):
         return True
-    if history:
+    if include_history_context and history:
         history_text = " ".join((turn.get("content") or "") for turn in history[-4:]).lower()
         if any(marker in history_text for marker in VEHICLE_KNOWLEDGE_MARKERS):
             return True
@@ -2898,7 +2972,43 @@ def ask_question(question, history=None, session_id=None):
             "evidence": {},
         }
 
-    query_type = "QUESTION"
+    query_type = _classify_query_type(question, history=history)
+    if query_type == "GENERAL_KNOWLEDGE":
+        _reset_vehicle_entity_context(session_id, history)
+        answer = _build_knowledge_fallback_answer(
+            question,
+            history=None,
+            include_document_preface=False,
+        )
+        _log_execution_path("GENERAL_KNOWLEDGE", memory_used=False, retriever_used=False, answer_source="LLM")
+        _log_intent_route("GENERAL_KNOWLEDGE", "LLM")
+        return {
+            "question": question,
+            "answer": _present_answer(question, answer, confidence="MEDIUM"),
+            "context": "",
+            "confidence": "MEDIUM",
+            "evidence": {},
+        }
+
+    if query_type == "FOLLOW_UP" and not _is_vehicle_question(question, history=history):
+        answer = _build_knowledge_fallback_answer(
+            question,
+            history=history,
+            include_document_preface=False,
+        )
+        _log_execution_path("FOLLOW_UP", memory_used=True, retriever_used=False, answer_source="LLM")
+        _log_intent_route("FOLLOW_UP", "LLM")
+        return {
+            "question": question,
+            "answer": _present_answer(question, answer, confidence="MEDIUM"),
+            "context": "",
+            "confidence": "MEDIUM",
+            "evidence": {},
+        }
+
+    _track_vehicle_entity(question, session_id, history)
+
+    query_type = "AUTOMOTIVE"
     history_retriever = create_history_aware_retriever(retriever, memory_manager=memory)
     question_type, _ = history_retriever.classify_question_type(question)
     previous_topic = _previous_user_topic(history, question)

@@ -87,6 +87,15 @@ function formatDocumentTimestamp(epochSeconds: number): string {
 
 function App() {
   const messageIdRef = useRef(1);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+
+  const scrollMessagesToBottom = (behavior: ScrollBehavior = 'smooth') => {
+    const container = messageListRef.current;
+    if (!container) {
+      return;
+    }
+    container.scrollTo({ top: container.scrollHeight, behavior });
+  };
 
   const makeMessage = (role: 'assistant' | 'user', text: string, timestamp?: string): Message => {
     const nextId = messageIdRef.current;
@@ -132,6 +141,10 @@ function App() {
     void load();
   }, []);
 
+  useEffect(() => {
+    scrollMessagesToBottom('auto');
+  }, [messages, isLoading, isTyping]);
+
   const revealAssistantMessage = async (answer: string, timestamp: string) => {
     const assistantMessage = makeMessage('assistant', '', timestamp);
     setMessages((prev) => [...prev, assistantMessage]);
@@ -154,6 +167,7 @@ function App() {
 
     const nowIso = new Date().toISOString();
     setMessages((prev) => [...prev, makeMessage('user', trimmed, nowIso)]);
+    requestAnimationFrame(() => scrollMessagesToBottom('smooth'));
     setInputValue('');
     setError('');
     setIsLoading(true);
@@ -333,7 +347,7 @@ function App() {
         </aside>
 
         <main className="chat-panel">
-          <div className="message-list">
+          <div className="message-list" ref={messageListRef}>
             {messages.map((message) => (
               <div key={message.id} className={`message-row ${message.role}`}>
                 <div className="g-card message-card">
