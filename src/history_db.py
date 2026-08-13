@@ -31,9 +31,16 @@ class HistoryStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    vector_store_dir TEXT
                 )
             """)
+            session_columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(chat_sessions)").fetchall()
+            }
+            if "vector_store_dir" not in session_columns:
+                conn.execute("ALTER TABLE chat_sessions ADD COLUMN vector_store_dir TEXT")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,16 +57,26 @@ class HistoryStore:
                     session_id INTEGER NOT NULL,
                     name TEXT NOT NULL,
                     size_kb REAL NOT NULL,
+                    storage_path TEXT,
+                    vector_store_dir TEXT,
                     timestamp TEXT NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES chat_sessions(id)
                 )
             """)
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(chat_documents)").fetchall()
+            }
+            if "storage_path" not in columns:
+                conn.execute("ALTER TABLE chat_documents ADD COLUMN storage_path TEXT")
+            if "vector_store_dir" not in columns:
+                conn.execute("ALTER TABLE chat_documents ADD COLUMN vector_store_dir TEXT")
     def create_session(self, title: str) -> int:
         now = self._now()
         with self._connection() as conn:
             cursor = conn.execute(
-                "INSERT INTO chat_sessions (title, created_at, updated_at) VALUES (?, ?, ?)",
-                (title, now, now),
+                "INSERT INTO chat_sessions (title, created_at, updated_at, vector_store_dir) VALUES (?, ?, ?, ?)",
+                (title, now, now, None),
             )
             return int(cursor.lastrowid)
 
@@ -70,6 +87,13 @@ class HistoryStore:
                 (title, self._now(), session_id),
             )
 
+    def update_session_vector_store(self, session_id: int, vector_store_dir: Optional[str]) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET vector_store_dir = ?, updated_at = ? WHERE id = ?",
+                (vector_store_dir, self._now(), session_id),
+            )
+
     def save_message(self, session_id: int, role: str, content: str) -> None:
         with self._connection() as conn:
             conn.execute(
@@ -77,12 +101,27 @@ class HistoryStore:
                 (session_id, role, content, self._now()),
             )
 
-    def save_document(self, session_id: int, name: str, size_kb: float) -> None:
+    def save_document(
+        self,
+        session_id: int,
+        name: str,
+        size_kb: float,
+        storage_path: Optional[str] = None,
+        vector_store_dir: Optional[str] = None,
+    ) -> int:
         with self._connection() as conn:
-            conn.execute(
-                "INSERT INTO chat_documents (session_id, name, size_kb, timestamp) VALUES (?, ?, ?, ?)",
-                (session_id, name, size_kb, self._now()),
+            cursor = conn.execute(
+                """
+                INSERT INTO chat_documents (session_id, name, size_kb, storage_path, vector_store_dir, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, name, size_kb, storage_path, vector_store_dir, self._now()),
             )
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+                (self._now(), session_id),
+            )
+            return int(cursor.lastrowid)
 
     def get_session_messages(self, session_id: int) -> List[Dict]:
         with self._connection() as conn:
@@ -95,15 +134,51 @@ class HistoryStore:
     def get_session_documents(self, session_id: int) -> List[Dict]:
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT name, size_kb, timestamp FROM chat_documents WHERE session_id = ? ORDER BY id ASC",
+                """
+                SELECT id, session_id, name, size_kb, storage_path, vector_store_dir, timestamp
+                FROM chat_documents
+                WHERE session_id = ?
+                ORDER BY id ASC
+                """,
                 (session_id,),
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def get_session_document(self, session_id: int, document_id: int) -> Optional[Dict]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, session_id, name, size_kb, storage_path, vector_store_dir, timestamp
+                FROM chat_documents
+                WHERE session_id = ? AND id = ?
+                """,
+                (session_id, document_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def count_session_documents(self, session_id: int) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM chat_documents WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return int(row["cnt"]) if row else 0
+
+    def delete_document(self, session_id: int, document_id: int) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "DELETE FROM chat_documents WHERE session_id = ? AND id = ?",
+                (session_id, document_id),
+            )
+            conn.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
+                (self._now(), session_id),
+            )
+
     def get_recent_sessions(self, limit: int = 20) -> List[Dict]:
         with self._connection() as conn:
             rows = conn.execute(
-                "SELECT id, title, created_at, updated_at FROM chat_sessions ORDER BY updated_at DESC LIMIT ?",
+                "SELECT id, title, created_at, updated_at, vector_store_dir FROM chat_sessions ORDER BY updated_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
@@ -111,7 +186,7 @@ class HistoryStore:
     def get_session(self, session_id: int) -> Optional[Dict]:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT id, title, created_at, updated_at FROM chat_sessions WHERE id = ?",
+                "SELECT id, title, created_at, updated_at, vector_store_dir FROM chat_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             return dict(row) if row else None

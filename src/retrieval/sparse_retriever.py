@@ -14,9 +14,11 @@ SQL_FILE = Path(CHROMA_DB_PATH) / "sparse_index.sqlite"
 
 
 class SparseRetriever:
-    def __init__(self, db_path: Path = SQL_FILE):
+    def __init__(self, db_path: Path = SQL_FILE, auto_build: bool = True):
         self.db_path = db_path
-        self._ensure_index()
+        self.auto_build = auto_build
+        if self.auto_build:
+            self._ensure_index()
 
     def _connect(self):
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -54,6 +56,8 @@ class SparseRetriever:
             conn.close()
 
     def _ensure_index(self):
+        if not self.auto_build:
+            return
         if not self._has_docs_table() or not self._has_metadata_columns():
             documents = load_pdfs(PDF_DIRECTORY)
             chunks = split_documents(documents)
@@ -113,7 +117,10 @@ class SparseRetriever:
 
     def search(self, query: str, k: int = 20) -> List[Document]:
         if not self._has_docs_table():
-            self._ensure_index()
+            if self.auto_build:
+                self._ensure_index()
+            if not self._has_docs_table():
+                return []
 
         match_query = self._build_match_query(query)
         if not match_query:

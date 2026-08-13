@@ -210,10 +210,7 @@ def _startup_fail_fast_check() -> None:
 # ---------------------------------------------------
 # Load Retriever
 # ---------------------------------------------------
-print("initializing Retriever...")
-retriever = get_retriever()
-history_aware_retriever = create_history_aware_retriever(retriever)
-print("Retriever initialized successfully.")
+print("Retriever initialization deferred to request-time session context.")
 
 # ---------------------------------------------------
 # Load Local LLM
@@ -3226,7 +3223,8 @@ def ask_question(question, history=None, session_id=None):
     _track_vehicle_entity(question, session_id, history)
 
     query_type = "AUTOMOTIVE"
-    history_retriever = create_history_aware_retriever(retriever, memory_manager=memory)
+    active_retriever = get_retriever(session_id=session_id)
+    history_retriever = create_history_aware_retriever(active_retriever, memory_manager=memory)
     question_type, _ = history_retriever.classify_question_type(question)
     previous_topic = _previous_user_topic(history, question)
     use_conversation_context = question_type == "Follow-up"
@@ -3241,7 +3239,7 @@ def ask_question(question, history=None, session_id=None):
             docs = history_retriever.retrieve(question, history=history)
     else:
         retrieval_query = (question or "").strip()
-        docs = retriever.invoke(retrieval_query)
+        docs = active_retriever.invoke(retrieval_query)
     diagnostic_top_k = max(TOP_K, 16) if _is_diagnostic_path_question(question) else TOP_K
     docs = rerank(retrieval_query, docs, top_k=diagnostic_top_k)
     docs = _filter_subject_evidence(question, docs)
@@ -3252,7 +3250,7 @@ def ask_question(question, history=None, session_id=None):
             question,
             rerank(
                 direct_query,
-                retriever.invoke(direct_query),
+                active_retriever.invoke(direct_query),
                 top_k=diagnostic_top_k if _is_diagnostic_path_question(question) else TOP_K,
             ),
         )
@@ -3270,7 +3268,7 @@ def ask_question(question, history=None, session_id=None):
             history=history if use_conversation_context else None,
         )
         if secondary_query != retrieval_query:
-            alt_docs = retriever.invoke(secondary_query)
+            alt_docs = active_retriever.invoke(secondary_query)
             alt_docs = rerank(
                 secondary_query,
                 alt_docs,
@@ -3299,11 +3297,23 @@ def ask_question(question, history=None, session_id=None):
             _topic_from_text(question),
             use_conversation_context,
         )
-        knowledge_answer = _build_knowledge_fallback_answer(
-            question,
-            history=history,
-            include_document_preface=True,
-        )
+        # For chat sessions with no uploaded documents, clearly state document unavailability
+        if session_id:
+            knowledge_answer = (
+                "This chat session has no documents uploaded. "
+                "Based on general knowledge: " +
+                _build_knowledge_fallback_answer(
+                    question,
+                    history=history,
+                    include_document_preface=False,
+                )
+            )
+        else:
+            knowledge_answer = _build_knowledge_fallback_answer(
+                question,
+                history=history,
+                include_document_preface=True,
+            )
         _log_intent_route("QUESTION", "LLM")
         _log_routing_decision("AUTOMOTIVE", "NOT_FOUND", "AUTOMOTIVE_KNOWLEDGE")
         return {
