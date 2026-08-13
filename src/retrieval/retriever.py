@@ -1,5 +1,11 @@
+from pathlib import Path
+
 from langchain_chroma import Chroma
 from embeddings.embedding_model import get_embedding_model
+try:
+    from history_db import HistoryStore
+except ModuleNotFoundError:
+    from src.history_db import HistoryStore
 from retrieval.sparse_retriever import SparseRetriever
 from config import (
     CHROMA_DB_PATH,
@@ -41,6 +47,11 @@ DIAGNOSTIC_CONTENT_MARKERS = (
     "select the following tree structures",
     "tree structure",
 )
+
+
+class EmptyRetriever:
+    def invoke(self, query: str):
+        return []
 
 
 def _is_diagnostic_query(query: str) -> bool:
@@ -171,10 +182,45 @@ class HybridRetriever:
         return [entry["doc"] for entry in scored_docs[:result_k]]
 
 
-def get_retriever():
+def get_retriever(session_id: int | None = None):
 
     embedding_model = get_embedding_model()
 
+    if session_id is not None:
+        history_store = HistoryStore()
+        session = history_store.get_session(session_id)
+        vector_store_dir = (session or {}).get("vector_store_dir") if session else None
+        if not vector_store_dir:
+            return EmptyRetriever()
+
+        session_chroma_dir = Path(str(vector_store_dir))
+        sparse_index_path = session_chroma_dir / "sparse_index.sqlite"
+        if not session_chroma_dir.exists() or not sparse_index_path.exists():
+            return EmptyRetriever()
+
+        try:
+            db = Chroma(
+                persist_directory=str(session_chroma_dir),
+                embedding_function=embedding_model,
+                collection_name=COLLECTION_NAME,
+            )
+            db.similarity_search("healthcheck", k=1)
+            sparse_retriever = SparseRetriever(db_path=sparse_index_path, auto_build=False)
+
+            return HybridRetriever(
+                db,
+                sparse_retriever,
+                HYBRID_K,
+                RETRIEVAL_K,
+                SPARSE_K,
+                HYBRID_DENSE_WEIGHT,
+            )
+        except Exception as exc:
+            print(f"Session retriever unavailable for session {session_id}: {exc}")
+            return EmptyRetriever()
+
+    # Global retriever only for non-session use (e.g., standalone scripts)
+    # Chat sessions should NEVER reach this code - they use EmptyRetriever if no docs uploaded
     try:
         db = Chroma(
             persist_directory=CHROMA_DB_PATH,
@@ -185,10 +231,8 @@ def get_retriever():
         # Force a lightweight operation so schema/config issues surface early.
         db.similarity_search("healthcheck", k=1)
     except Exception as exc:
-        print(f"Chroma store unavailable or invalid, rebuilding index: {exc}")
-        documents = load_pdfs(PDF_DIRECTORY)
-        chunks = split_documents(documents)
-        db = create_vector_db(chunks)
+        print(f"Global chroma store unavailable: {exc}")
+        return EmptyRetriever()
 
     sparse_retriever = SparseRetriever()
 

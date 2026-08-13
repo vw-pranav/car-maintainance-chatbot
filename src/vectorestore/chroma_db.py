@@ -3,6 +3,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
+from typing import Union
 
 from langchain_chroma import Chroma
 from embeddings.embedding_model import get_embedding_model
@@ -27,10 +28,9 @@ def _remove_path(path: Path):
             path.unlink(missing_ok=True)
 
 
-def create_vector_db(chunks):
+def _create_vector_db_with_persist(chunks, persist_dir: Path):
     embedding_model = get_embedding_model()
 
-    persist_dir = Path(CHROMA_DB_PATH)
     build_dir = persist_dir.parent / f"{persist_dir.name}__build__{uuid.uuid4().hex}"
     _remove_path(build_dir)
 
@@ -67,8 +67,8 @@ def create_vector_db(chunks):
         except Exception:
             pass
         raise RuntimeError(
-            "Unable to update 'chroma_db' because it is currently in use by another process. "
-            "Stop the running backend/app that is using Chroma and run ingest again."
+            f"Unable to update '{persist_dir}' because it is currently in use by another process. "
+            "Stop the running backend/app that is using Chroma and retry the operation."
         ) from last_swap_error
 
     return Chroma(
@@ -76,3 +76,39 @@ def create_vector_db(chunks):
         embedding_function=embedding_model,
         collection_name=COLLECTION_NAME,
     )
+
+
+def create_vector_db(
+    chunks,
+    persist_directory: Union[str, Path, None] = None,
+    use_atomic_swap: bool = True,
+):
+    persist_dir = Path(persist_directory) if persist_directory is not None else Path(CHROMA_DB_PATH)
+    if use_atomic_swap:
+        return _create_vector_db_with_persist(chunks, persist_dir)
+    return create_vector_db_direct(chunks, persist_directory=persist_dir)
+
+
+def create_vector_db_direct(chunks, persist_directory: Union[str, Path]):
+    persist_dir = Path(persist_directory)
+    _remove_path(persist_dir)
+    os.makedirs(persist_dir, exist_ok=True)
+
+    db = Chroma.from_documents(
+        documents=chunks,
+        embedding=get_embedding_model(),
+        persist_directory=str(persist_dir),
+        collection_name=COLLECTION_NAME,
+    )
+
+    create_sparse_index(chunks, db_path=persist_dir / "sparse_index.sqlite")
+
+    return db
+
+
+def create_vector_db_at_path(chunks, persist_directory: Union[str, Path]):
+    return create_vector_db(chunks, persist_directory=persist_directory)
+
+
+def remove_vector_db(persist_directory: Union[str, Path]) -> None:
+    _remove_path(Path(persist_directory))

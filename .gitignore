@@ -20,6 +20,8 @@ ragas_env/
 
 # Chroma DB
 chroma_db/
+chroma_db__build__*/
+chroma_sessions/
 
 # Ollama Models
 models/
@@ -48,13 +50,5 @@ node_modules/
 .streamlit/secrets.toml
 
 data/raw/
-<<<<<<< HEAD
+data/chat_uploads/
 garagegpt_history.db
-=======
-
-
-
-garagegpt_history.db
- 
- 
->>>>>>> origin/feature/output-improvements

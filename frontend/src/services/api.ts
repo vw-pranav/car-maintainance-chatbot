@@ -31,6 +31,7 @@ export interface DocumentsItem {
 }
 
 export interface UploadResponse {
+  session_id: number;
   document_id: number;
   filename: string;
   size_kb: number;
@@ -54,6 +55,7 @@ export interface HistorySessionResponse {
   };
   messages: HistorySessionMessage[];
   documents: Array<{
+    id: number;
     name: string;
     size_kb: number;
     timestamp: string;
@@ -129,6 +131,16 @@ export async function uploadDocument(file: File, sessionId?: number): Promise<Up
   }
 
   return response.json();
+}
+
+export async function deleteHistoryDocument(sessionId: number, documentId: number): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/history/${sessionId}/documents/${documentId}`, {
+    method: 'DELETE',
+  });
+
+  if (!response.ok) {
+    return parseError(response);
+  }
 }
 
 export async function deleteHistorySession(sessionId: number): Promise<void> {
