@@ -736,6 +736,11 @@ def _is_type_enumeration_question(question: str) -> bool:
     return any(marker in lowered for marker in ["types of", "kinds of", "categories of", "classifications of"])
 
 
+def _is_elaboration_request(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    return any(marker in lowered for marker in ["explain", "elaborate", "give details", "in detail", "compare", "difference between"])
+
+
 def _build_knowledge_fallback_prompt(
     question: str,
     *,
@@ -756,28 +761,45 @@ def _build_knowledge_fallback_prompt(
     else:
         preface_rule = "Answer using general knowledge in a concise, clear way."
 
+    elaboration = _is_elaboration_request(question)
+
     style_rule = ""
     if vehicle_question:
         style_rule = (
-            "Keep the answer concise and procedural for vehicle/service questions. "
+            "Keep the answer concise and procedural. "
             "Use short steps or bullets only when they improve clarity."
+        )
+    elif type_enumeration_question and not elaboration:
+        style_rule = (
+            "Answer with a clean numbered list. Rules:\n"
+            "• One item per line with its name as the heading.\n"
+            "• Under each item add a single short sub-bullet (one line) — the symbol set, core purpose, or one key fact.\n"
+            "• Do NOT write a paragraph, definition block, or example under every item.\n"
+            "• After the full list, add ONE combined 'Example:' block at the end if a code snippet genuinely helps.\n"
+            "• Do NOT repeat the pattern Definition / Key Types / Example for each item.\n"
+            "• Total answer should be compact — think of a cheat-sheet, not a tutorial."
+        )
+    elif concept_question and elaboration:
+        style_rule = (
+            "Give a thorough but structured explanation:\n"
+            "• Open with one direct sentence.\n"
+            "• Use ## headings whose names fit the topic — never 'Definition', 'Key Types', or 'Key Steps'.\n"
+            "• Use numbered lists for sequences; bullets for unordered sets.\n"
+            "• Include concrete examples where they help.\n"
+            "• End with a one-sentence summary."
         )
     elif concept_question:
         style_rule = (
-            "Use educational formatting similar to Copilot/ChatGPT for concept questions. "
-            "Start with one direct answer sentence, then use helpful headings when useful. "
-            "Preferred section flow: Definition, Key Types/Steps, Example (if useful), Summary."
+            "Keep the answer concise and Copilot-style:\n"
+            "• One direct opening sentence.\n"
+            "• A tight numbered or bulleted list for the main points — one line each.\n"
+            "• One short example at the end if it adds value.\n"
+            "• No repeated Definition/Example/Summary blocks per item."
         )
     else:
         style_rule = (
-            "Write in a professional, conversational style. "
-            "Start with a direct answer first, then add short structure only when useful."
-        )
-
-    type_rule = ""
-    if type_enumeration_question:
-        type_rule = (
-            "If the user asks for types/categories, provide a numbered list with each type name and a short description."
+            "Write in a natural, conversational style. "
+            "Start with a direct answer, then add brief structure only where it genuinely helps."
         )
 
     return f"""
@@ -787,7 +809,6 @@ Answer the user naturally, concisely, and directly.
 Do not mention retrieval failures, search failures, chunking, or internal system limitations.
 {preface_rule}
 {style_rule}
-{type_rule}
 
 If the user asks for tools, torque values, diagnostic paths, prerequisites, or specifications, return a structured bullet list.
 
