@@ -236,9 +236,7 @@ def clean_context(text, metadata: Dict[str, Any] | None = None):
         "audi ag",
         "ingolstadt",
         "publisher",
-        "table of contents",
-        "contents",
-        "page",
+        # "table of contents" / "contents" kept so structure queries find section headings
         "all additional procedures are described",
         "additional procedures:",
         "tightening specifications",
@@ -705,6 +703,134 @@ def _present_answer(question: str, answer: str, confidence: str = "HIGH") -> str
         return text.strip()
 
     return _strip_optional_evidence_sections(text)
+
+
+# ---------------------------------------------------------------------------
+# Document-understanding detection and answer builder
+# ---------------------------------------------------------------------------
+
+_DOCUMENT_UNDERSTANDING_MARKERS = [
+    "what is this document about",
+    "what is this manual about",
+    "what does this document cover",
+    "what does this manual cover",
+    "summarize this document",
+    "summarize this manual",
+    "summarize the document",
+    "summarize the manual",
+    "give me a summary",
+    "give a summary",
+    "what topics are covered",
+    "what topics does",
+    "what chapters",
+    "list the chapters",
+    "what sections",
+    "list the sections",
+    "what repair groups",
+    "list repair groups",
+    "what is covered in this",
+    "overview of this document",
+    "overview of this manual",
+    "contents of this document",
+    "contents of this manual",
+    "what are the contents",
+    "table of contents",
+    "what are the topics",
+    "what can i find in this",
+    "what information is in this",
+    "explain this document",
+    "tell me about this document",
+    "tell me about this manual",
+]
+
+
+def _is_document_understanding_question(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower()).rstrip("?.")
+    return any(marker in lowered for marker in _DOCUMENT_UNDERSTANDING_MARKERS)
+
+
+def _session_has_documents(session_id: Any) -> bool:
+    if not session_id:
+        return False
+    try:
+        from history_db import HistoryStore as _HistoryStore
+        _store = _HistoryStore()
+        return _store.count_session_documents(int(session_id)) > 0
+    except Exception:
+        return False
+
+
+def _get_session_document_names(session_id: Any) -> List[str]:
+    if not session_id:
+        return []
+    try:
+        from history_db import HistoryStore as _HistoryStore
+        docs = _HistoryStore().get_session_documents(int(session_id))
+        return [d.get("name") or "" for d in docs if d.get("name")]
+    except Exception:
+        return []
+
+
+def _build_document_understanding_answer(
+    question: str,
+    session_id: Any,
+    active_retriever: Any,
+    doc_names: List[str],
+) -> str:
+    # Broad queries that surface section headings, repair groups, and TOC-like content
+    structure_queries = [
+        "table of contents chapters sections repair groups overview",
+        "repair group chapter section contents",
+        "introduction overview manual contents",
+    ]
+    collected_chunks: List[str] = []
+    seen: set = set()
+    for q in structure_queries:
+        try:
+            docs = active_retriever.invoke(q)
+        except Exception:
+            docs = []
+        for doc in (docs or []):
+            text = clean_context(getattr(doc, "page_content", "") or "")
+            key = text[:200]
+            if text.strip() and key not in seen:
+                seen.add(key)
+                collected_chunks.append(text)
+        if len(collected_chunks) >= 10:
+            break
+
+    doc_label = ", ".join(doc_names) if doc_names else "the uploaded document"
+    context_text = "\n\n".join(collected_chunks[:10]) if collected_chunks else ""
+
+    prompt = f"""You are GarageGPT, an automotive service manual assistant.
+
+The user has uploaded a document: {doc_label}
+
+Your task: Give a clear document overview based on the retrieved content below.
+
+Rules:
+- Start with a one-sentence description of what the document is about.
+- List the main topics, sections, chapters, or repair groups as bullet points.
+- If you can identify specific repair groups (e.g. "Repair group 19 – Cooling system"), list them.
+- Keep bullets concise — one line each.
+- If the retrieved content clearly shows a table of contents or section headings, use those directly.
+- Do NOT invent topics that are not in the retrieved content.
+- End with one sentence summarising the document's primary purpose.
+
+Retrieved document content:
+{context_text if context_text else "(No structure content retrieved — answer based on the document name only.)"}
+
+User question: {question}
+
+Answer:
+"""
+    try:
+        response = _invoke_llm(prompt, stage="document_understanding")
+        return (response.content or "").strip()
+    except Exception:
+        if doc_names:
+            return f"The uploaded document is **{doc_label}**. Ask me a specific question about it and I'll find the answer for you."
+        return "A document is uploaded for this session. Ask me a specific question and I'll answer from it."
 
 
 def _is_concept_explanation_question(question: str) -> bool:
@@ -3224,6 +3350,21 @@ def ask_question(question, history=None, session_id=None):
 
     query_type = "AUTOMOTIVE"
     active_retriever = get_retriever(session_id=session_id)
+
+    # Document-understanding route: summarise/outline the uploaded document
+    if _is_document_understanding_question(question) and _session_has_documents(session_id):
+        doc_names = _get_session_document_names(session_id)
+        answer = _build_document_understanding_answer(question, session_id, active_retriever, doc_names)
+        _log_intent_route("DOCUMENT_UNDERSTANDING", "DOCUMENT")
+        _log_execution_path("DOCUMENT_UNDERSTANDING", memory_used=False, retriever_used=True, answer_source="DOCUMENT")
+        return {
+            "question": question,
+            "answer": answer,
+            "context": "",
+            "confidence": "MEDIUM",
+            "evidence": {},
+        }
+
     history_retriever = create_history_aware_retriever(active_retriever, memory_manager=memory)
     question_type, _ = history_retriever.classify_question_type(question)
     previous_topic = _previous_user_topic(history, question)

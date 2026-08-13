@@ -240,9 +240,9 @@ class ChatbotGroundingTests(unittest.TestCase):
             include_document_preface=False,
         )
 
-        self.assertIn("Start with one direct answer sentence", prompt)
-        self.assertIn("Definition, Key Types/Steps, Example (if useful), Summary", prompt)
         self.assertIn("numbered list", prompt)
+        self.assertNotIn("Definition, Key Types/Steps", prompt)
+        self.assertNotIn("Definition:", prompt)
 
     def test_present_answer_removes_robotic_sections_by_default(self):
         raw = (
