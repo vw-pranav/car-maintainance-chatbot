@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  GroupuiBrandLogo,
   GroupuiButton,
   GroupuiLoading,
 } from '@group-ui/group-ui-react';
@@ -335,6 +334,10 @@ function App() {
     }
   };
 
+  const sidebarHeading = isSidebarCollapsed
+    ? 'C\nh\na\nt\n\nH\ni\ns\nt\no\nr\ny'
+    : 'Chat History';
+
   return (
     <div className={`app-shell ${isUploading ? 'is-uploading' : ''} ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <div className="topbar">
@@ -347,9 +350,15 @@ function App() {
       <div className="layout">
         <aside className="sidebar">
           <div className="sidebar-brand-row">
-            <GroupuiBrandLogo alwaysCompact type="application">
-              GarageGPT
-            </GroupuiBrandLogo>
+            <button
+              className={`sidebar-collapse-icon ${isSidebarCollapsed ? 'is-collapsed' : ''}`}
+              onClick={() => setIsSidebarCollapsed((collapsed) => !collapsed)}
+              aria-label={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              title={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            >
+              <span className="sidebar-collapse-arrow" aria-hidden="true" />
+            </button>
+            <groupui-headline class="sidebar-heading" heading="h4">{sidebarHeading}</groupui-headline>
           </div>
 
           <div className="sidebar-history-scroll">
@@ -376,15 +385,6 @@ function App() {
             </GroupuiButton>
           </div>
         </aside>
-
-        <button
-          className="sidebar-toggle"
-          onClick={() => setIsSidebarCollapsed((collapsed) => !collapsed)}
-          aria-label={isSidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
-          title={isSidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
-        >
-          {isSidebarCollapsed ? '>' : '<'}
-        </button>
 
         <main className="chat-panel">
           <div className="message-list" ref={messageListRef}>
