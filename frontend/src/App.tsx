@@ -1,4 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   GroupuiButton,
   GroupuiLoading,
@@ -392,7 +394,13 @@ function App() {
               <div key={message.id} className={`message-row ${message.role}`}>
                 <div className="g-card message-card">
                   <strong className="message-sender">{message.role === 'assistant' ? 'GarageGPT' : 'You'}</strong>
-                  <div className="message-content">{message.text}</div>
+                  <div className="message-content">
+                    {message.role === 'assistant' ? (
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.text}</ReactMarkdown>
+                    ) : (
+                      message.text
+                    )}
+                  </div>
                   <div className="message-timestamp">{formatSessionTimestamp(message.timestamp)}</div>
                 </div>
               </div>

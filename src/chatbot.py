@@ -676,6 +676,25 @@ def _should_include_evidence_sections(question: str, confidence: str = "HIGH") -
     return any(marker in lowered for marker in evidence_markers)
 
 
+# Inline-bullet patterns the LLM sometimes produces (e.g. "• Foo. • Bar." on one line)
+_INLINE_BULLET_RE = re.compile(
+    r"(?<=[.!?\w])\s+(\*|•|-|\d+\.(?=\s))\s+",
+)
+
+
+def _normalize_list_formatting(text: str) -> str:
+    """Split collapsed inline bullets onto separate lines and ensure blank line before first item."""
+    if not text:
+        return text
+    # Expand inline bullets to newline-separated items
+    text = _INLINE_BULLET_RE.sub(r"\n\1 ", text)
+    # Ensure a blank line exists before any list block that directly follows prose
+    text = re.sub(r"([^\n])\n([ \t]*(\*|-|\d+\.)\s)", r"\1\n\n\2", text)
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
 def _strip_optional_evidence_sections(answer: str) -> str:
     text = (answer or "").strip()
     if not text:
@@ -700,9 +719,9 @@ def _present_answer(question: str, answer: str, confidence: str = "HIGH") -> str
         text = re.sub(r"\n\nAdditional Information:\n", "\n\nNotes:\n", text, flags=re.IGNORECASE)
         text = re.sub(r"^Answer:\s*\n", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
+        return _normalize_list_formatting(text).strip()
 
-    return _strip_optional_evidence_sections(text)
+    return _normalize_list_formatting(_strip_optional_evidence_sections(text))
 
 
 # ---------------------------------------------------------------------------

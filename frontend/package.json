@@ -11,7 +11,9 @@
   "dependencies": {
     "@group-ui/group-ui-react": "https://groupui.vwapps.run/specific/14.1.0/packages/group-ui-react.tgz",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
