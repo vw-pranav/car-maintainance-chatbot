@@ -1,6 +1,7 @@
 import sys
 import uuid
 import shutil
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +22,7 @@ from processing.text_splitter import split_documents
 from vectorestore.chroma_db import create_vector_db, remove_vector_db
 
 app = FastAPI(title="GarageGPT API", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -184,13 +186,46 @@ def _documents_payload() -> list[dict]:
 
 def get_backend_answer(message: str, session_id: int) -> dict:
     session_history = history_store.get_session_messages(session_id)
-    result = ask_question(message, history=session_history, session_id=session_id)
+    indexing = history_store.get_session_indexing_status(session_id) or {}
+    document_available = indexing.get("indexing_status") == "READY"
+    result = ask_question(
+        message,
+        history=session_history,
+        session_id=session_id,
+        document_available=document_available,
+    )
     return {
         "question": result.get("question", message),
         "answer": result.get("answer", ""),
         "context": result.get("context", ""),
         "session_id": session_id,
     }
+
+
+def _indexing_gate_response(message: str, session_id: int) -> Optional[dict]:
+    status = history_store.get_session_indexing_status(session_id)
+    if not status:
+        return None
+
+    indexing_status = status.get("indexing_status", "READY")
+    if indexing_status in {"PENDING", "PROCESSING"}:
+        return {
+            "question": message,
+            "answer": "Your document is still being processed. Please wait a moment and try again.",
+            "context": "",
+            "session_id": session_id,
+        }
+
+    if indexing_status == "FAILED":
+        error = (status.get("indexing_error") or "the document could not be indexed").strip()
+        return {
+            "question": message,
+            "answer": f"I couldn't answer from your document because indexing failed: {error}",
+            "context": "",
+            "session_id": session_id,
+        }
+
+    return None
 
 
 @app.get("/health")
@@ -205,6 +240,13 @@ def chat(request: ChatRequest):
 
     try:
         session_id = _ensure_session(request.session_id)
+        logger.info("FirstQuestionReceived session_id=%s message=%s", session_id, request.message[:120])
+
+        gated_response = _indexing_gate_response(request.message, session_id)
+        if gated_response:
+            history_store.save_message(session_id, "user", request.message)
+            history_store.save_message(session_id, "assistant", gated_response["answer"])
+            return gated_response
 
         response = get_backend_answer(request.message, session_id=session_id)
         history_store.save_message(session_id, "user", request.message)
@@ -315,9 +357,27 @@ def upload_document(file: UploadFile = File(...), session_id: Optional[int] = No
             size_kb,
             storage_path=str(destination),
             vector_store_dir=None,
+            indexing_status="PROCESSING",
         )
+        logger.info("UploadStart session_id=%s document_id=%s filename=%s", use_session_id, document_id, safe_name)
 
         indexed_chunks = _rebuild_session_index(use_session_id)
+        if indexed_chunks <= 0:
+            raise RuntimeError("no readable content was found in the uploaded PDF")
+
+        session = history_store.get_session(use_session_id) or {}
+        vector_store_dir = session.get("vector_store_dir")
+        if not vector_store_dir:
+            raise RuntimeError("vector store directory was not recorded after indexing")
+
+        history_store.update_document_indexing(
+            use_session_id,
+            document_id,
+            "READY",
+            vector_store_dir=str(vector_store_dir),
+        )
+        logger.info("VectorStoreDirUpdated session_id=%s document_id=%s vector_store_dir=%s", use_session_id, document_id, vector_store_dir)
+        logger.info("IndexingComplete session_id=%s document_id=%s chunks=%s", use_session_id, document_id, indexed_chunks)
 
         return {
             "session_id": use_session_id,
@@ -325,16 +385,20 @@ def upload_document(file: UploadFile = File(...), session_id: Optional[int] = No
             "filename": safe_name,
             "size_kb": size_kb,
             "uploaded_at": int(destination.stat().st_mtime),
-            "status": "indexed",
+            "status": "READY",
             "message": f"Indexed {indexed_chunks} chunks",
         }
     except HTTPException:
         raise
     except Exception as exc:
         if document_id is not None:
-            history_store.delete_document(use_session_id, document_id)
-        if destination.exists():
-            destination.unlink(missing_ok=True)
+            history_store.update_document_indexing(
+                use_session_id,
+                document_id,
+                "FAILED",
+                error=str(exc),
+            )
+            logger.exception("IndexingFailed session_id=%s document_id=%s", use_session_id, document_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         file.file.close()

@@ -1,13 +1,18 @@
 import re
+import os
 
-from sentence_transformers import CrossEncoder
+CrossEncoder = None
 
 print("Loading Re-ranker...")
 
 reranker = None
 
 try:
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    if os.getenv("ENABLE_CROSS_ENCODER", "0") != "1":
+        raise RuntimeError("cross-encoder disabled; using heuristic ranking")
+    from sentence_transformers import CrossEncoder as _CrossEncoder
+
+    reranker = _CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
     print("Re-ranker Loaded Successfully!")
 except Exception as exc:
     print(f"Re-ranker unavailable: {exc}")
@@ -70,37 +75,6 @@ def _question_operation_terms(question):
 
     return list(dict.fromkeys(terms))
 
-
-def _is_diagnostic_question(question):
-    question_lower = _normalize_text(question)
-    return any(
-        marker in question_lower
-        for marker in [
-            "diagnostic",
-            "control unit",
-            "guided function",
-            "adaptation",
-            "basic setting",
-            "menu level",
-        ]
-    )
-
-
-def _diagnostic_menu_boost(content):
-    content_lower = _normalize_text(content)
-    markers = [
-        "select diagnostic",
-        "individual tests",
-        "diagnostic-capable systems",
-        "engine electronics",
-        "guided functions",
-        "adaptation",
-        "basic settings",
-        "select the following tree structures",
-        "tree structure",
-    ]
-    return min(8.0, sum(marker in content_lower for marker in markers) * 1.5)
-
 def _has_numbered_steps(content):
     return bool(re.search(r"(?m)^\s*\d+[.)]\s+\S", content or ""))
 
@@ -122,13 +96,10 @@ def _heuristic_adjustment(question, doc):
         score += 5.0
 
     if any(term in content_lower for term in ["diagnostic", "fault code", "dtc", "scan tool", "control unit", "measuring blocks"]) and not _has_numbered_steps(content):
-        score -= 10.0 if not _is_diagnostic_question(question) else 0.0
-
-    if _is_diagnostic_question(question):
-        score += _diagnostic_menu_boost(content)
+        score -= 10.0
 
     if any(term in content_lower for term in ["adaptation", "basic setting", "basic settings", "teach-in", "coding"]) and not _has_numbered_steps(content):
-        score -= 10.0 if not _is_diagnostic_question(question) else 0.0
+        score -= 10.0
 
     if any(term in content_lower for term in ["warning", "warnings", "caution", "note", "notes", "important", "attention"]) and not _has_numbered_steps(content):
         score -= 10.0
@@ -169,22 +140,6 @@ def _rank_docs(question, docs, base_scores=None):
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [doc for _, doc in ranked]
 
-def _is_table_intent(question: str) -> bool:
-    q = (question or "").lower()
-    markers = [
-        "table",
-        "tools",
-        "equipment",
-        "specification",
-        "torque",
-        "part number",
-        "diagnostic path",
-        "control module",
-        "menu path",
-    ]
-    return any(marker in q for marker in markers)
-
-
 def rerank(question, docs, top_k=8):
     if not docs:
         return []
@@ -204,11 +159,8 @@ def rerank(question, docs, top_k=8):
 
     ranked = []
     for score, doc in zip(scores, docs):
-        metadata_boost = _metadata_boost(doc)
-        content = (doc.page_content or "").lower()
-        if any(term in content for term in ["coolant", "fuel injection", "ignition", "compressor"]):
-            metadata_boost -= 1.0
-        ranked.append((score + metadata_boost, doc))
+        total_score = float(score) + _metadata_boost(doc) + _heuristic_adjustment(question, doc)
+        ranked.append((total_score, doc))
 
     ranked = sorted(ranked, key=lambda x: x[0], reverse=True)
 

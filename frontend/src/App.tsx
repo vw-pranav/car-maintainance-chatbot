@@ -334,10 +334,6 @@ function App() {
     }
   };
 
-  const sidebarHeading = isSidebarCollapsed
-    ? 'C\nh\na\nt\n\nH\ni\ns\nt\no\nr\ny'
-    : 'Chat History';
-
   return (
     <div className={`app-shell ${isUploading ? 'is-uploading' : ''} ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <div className="topbar">
@@ -358,7 +354,10 @@ function App() {
             >
               <span className="sidebar-collapse-arrow" aria-hidden="true" />
             </button>
-            <groupui-headline class="sidebar-heading" heading="h4">{sidebarHeading}</groupui-headline>
+            <groupui-headline class="sidebar-heading" heading="h4" title="Chat History">
+              <span className="sidebar-history-label">Chat History</span>
+              <span className="sidebar-history-icon" aria-hidden="true">&#x23F1;</span>
+            </groupui-headline>
           </div>
 
           <div className="sidebar-history-scroll">
