@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _EVIDENCE_SNAPSHOTS: Dict[str, Dict[str, Any]] = {}
 _ACTIVE_VEHICLE_ENTITY: Dict[str, str | None] = {}
+retriever = None
 
 
 TABLE_INTENT_MARKERS = [
@@ -390,6 +391,23 @@ def _session_context_key(session_id: Any, history: List[Dict[str, Any]] | None) 
     )
     digest = hashlib.sha256(history_text.encode("utf-8")).hexdigest()[:16]
     return f"history:{digest}"
+
+
+def _session_has_ready_document(session_id: Any) -> bool:
+    if session_id is None:
+        return False
+
+    try:
+        try:
+            from history_db import HistoryStore
+        except ModuleNotFoundError:
+            from src.history_db import HistoryStore
+
+        status = HistoryStore().get_session_indexing_status(int(session_id))
+        return bool(status and status.get("indexing_status") == "READY")
+    except Exception:
+        logger.exception("Unable to inspect document readiness for session %s", session_id)
+        return False
 
 
 def _reset_vehicle_entity_context(session_id: Any, history: List[Dict[str, Any]] | None) -> None:
@@ -888,12 +906,19 @@ def _build_knowledge_fallback_prompt(
     *,
     vehicle_question: bool,
     include_document_preface: bool,
+    document_available: bool = False,
 ) -> str:
     concept_question = _is_concept_explanation_question(question)
     type_enumeration_question = _is_type_enumeration_question(question)
 
     preface_rule = ""
-    if vehicle_question and include_document_preface:
+    if document_available:
+        preface_rule = (
+            "Start by saying that the uploaded document does not cover this specific question, "
+            "then provide a concise helpful answer from relevant broader knowledge. "
+            "Do not assume the uploaded document's domain."
+        )
+    elif vehicle_question and include_document_preface:
         preface_rule = (
             "Start with exactly: \"The available document does not provide details on this topic. "
             "Based on automotive knowledge, ...\" and then answer the question clearly."
@@ -964,6 +989,7 @@ def _build_knowledge_fallback_answer(
     *,
     history: List[Dict[str, Any]] | None,
     include_document_preface: bool,
+    document_available: bool = False,
 ) -> str:
     vehicle_question = _is_vehicle_question(question, history=history)
     history_context = ""
@@ -980,6 +1006,7 @@ def _build_knowledge_fallback_answer(
         question,
         vehicle_question=vehicle_question,
         include_document_preface=include_document_preface and vehicle_question,
+        document_available=document_available,
     )
     if history_context:
         prompt = prompt.replace(
@@ -990,6 +1017,11 @@ def _build_knowledge_fallback_answer(
         response = _invoke_llm(prompt, stage="knowledge_fallback")
         return (response.content or "").strip()
     except Exception:
+        if document_available:
+            return (
+                "The uploaded document does not cover this specific question. "
+                "Based on broader knowledge, I can still help if you share a little more context."
+            )
         if vehicle_question and include_document_preface:
             return (
                 "The available document does not provide details on this topic. "
@@ -2647,6 +2679,37 @@ def _filter_subject_evidence(question: str, docs):
         
         if direct_docs:
             return direct_docs
+
+    subject_tokens = set(_question_subject_tokens(question))
+    subject_tokens.difference_update({
+        "required",
+        "equipment",
+        "tool",
+        "tools",
+        "procedure",
+        "information",
+        "document",
+        "question",
+    })
+    if subject_tokens and len(docs) > 1:
+        scored_subject_docs = []
+        for doc in docs:
+            metadata = getattr(doc, "metadata", {}) or {}
+            section_hints = metadata.get("section_hints", [])
+            if isinstance(section_hints, str):
+                section_hints = [section_hints]
+            text = " ".join(
+                [
+                    getattr(doc, "page_content", "") or "",
+                    " ".join(str(item) for item in section_hints if item),
+                ]
+            ).lower()
+            tokens = set(re.findall(r"[a-z0-9]+", text))
+            scored_subject_docs.append((len(subject_tokens.intersection(tokens)), doc))
+
+        highest_subject_score = max(score for score, _ in scored_subject_docs)
+        if highest_subject_score > 0:
+            docs = [doc for score, doc in scored_subject_docs if score == highest_subject_score]
     
     # General procedure consistency filtering
     if len(docs) <= 1:
@@ -2918,7 +2981,7 @@ def validate_reasoning_answer(question, context, answer):
     return strict_answer
 
 
-def build_answer_prompt(question, context, history=None, top_evidence="", secondary_evidence=""):
+def build_answer_prompt(question, context, history=None, top_evidence="", secondary_evidence="", document_domain="automotive"):
     explanation_guidance = get_question_explanation_guidance(question, history=history)
     history_text = ""
     followup_context = build_followup_context(history)
@@ -2972,14 +3035,17 @@ Do NOT summarise into a paragraph.
 Preserve each item as a separate bullet point exactly as stated in the Context.
 """
 
+    assistant_domain = "automotive service manual" if document_domain == "automotive" else f"assistant for {document_domain} documents"
+    knowledge_domain = "automotive" if document_domain == "automotive" else "the uploaded document's subject"
+
     return f"""
-You are GarageGPT, an automotive service manual assistant.
+You are GarageGPT, an {assistant_domain}.
 
 Answer naturally like Microsoft Copilot or ChatGPT.
 
 Priority order:
 1. Retrieved document evidence.
-2. Automotive knowledge.
+2. {knowledge_domain} knowledge.
 3. General knowledge.
 
 Conversation rules:
@@ -3003,7 +3069,7 @@ Grounding rules:
 - If the documentation does not explicitly state a reason, say exactly:
     The documentation does not explicitly state the reason.
 - If the Context does not cover the answer and the question is vehicle-related, respond gracefully with:
-        The available document does not provide details on this topic. Based on automotive knowledge, ...
+        The available document does not provide details on this topic. Based on {knowledge_domain} knowledge, ...
     Then provide a concise, practical answer.
 - If the question is not vehicle-related, answer using general knowledge.
 
@@ -3063,15 +3129,17 @@ ANSWER
 """
 
 
-def build_verification_prompt(question, context, draft_answer, history=None, top_evidence="", secondary_evidence=""):
+def build_verification_prompt(question, context, draft_answer, history=None, top_evidence="", secondary_evidence="", document_domain="automotive"):
     explanation_guidance = get_question_explanation_guidance(question, history=history)
     memory_context = build_followup_context(history)
+
+    knowledge_domain = "automotive" if document_domain == "automotive" else "the uploaded document's subject"
 
     return f"""
 Review the draft answer below for grounding, accuracy, and GarageGPT response style.
 
 Rules:
-- Use provided Context first, but allow automotive/general knowledge when Context does not cover the question.
+- Use provided Context first, but allow {knowledge_domain}/general knowledge when Context does not cover the question.
 - Remove any sentence that is not directly supported by the Context.
 - Keep the answer conversational, helpful, and concise.
 - Answer the user's question directly first.
@@ -3101,7 +3169,7 @@ Rules:
 - Do not repeat the same sentence in Answer and How We Know.
 - Omit unrelated context instead of adding it as Additional Information.
 - If Context does not support the answer and the question is vehicle-related, begin with:
-        The available document does not provide details on this topic. Based on automotive knowledge, ...
+        The available document does not provide details on this topic. Based on {knowledge_domain} knowledge, ...
     then answer helpfully.
 
 ========================
@@ -3133,9 +3201,11 @@ VERIFIED ANSWER
 """
 
 
-def build_rewrite_prompt(question, context, draft_answer, history=None, top_evidence="", secondary_evidence=""):
+def build_rewrite_prompt(question, context, draft_answer, history=None, top_evidence="", secondary_evidence="", document_domain="automotive"):
     explanation_guidance = get_question_explanation_guidance(question, history=history)
     memory_context = build_followup_context(history)
+
+    knowledge_domain = "automotive" if document_domain == "automotive" else "the uploaded document's subject"
 
     return f"""
 Rewrite the draft answer into GarageGPT style.
@@ -3145,7 +3215,7 @@ Rules:
 - Use a natural, conversational, helpful tone.
 - Answer directly first.
 - Do not copy large source phrases verbatim.
-- Use Context first; if Context does not cover the question, use automotive/general knowledge gracefully.
+- Use Context first; if Context does not cover the question, use {knowledge_domain}/general knowledge gracefully.
 - If table evidence exists, keep table-derived values in structured form and preserve header-to-value relationships.
 - Do not add unsupported reasons, explanations, steps, or engineering intent.
 - Never invent missing table values.
@@ -3167,7 +3237,7 @@ Rules:
 - Do not repeat the same sentence in Answer and How We Know.
 - Omit unrelated context instead of adding it as Additional Information.
 - If Context does not support the answer and the question is vehicle-related, begin with:
-    The available document does not provide details on this topic. Based on automotive knowledge, ...
+    The available document does not provide details on this topic. Based on {knowledge_domain} knowledge, ...
 - If the user asked for equipment, tools, specifications, torque values, part numbers, menu paths, or control modules, format the answer as a structured list under Answer.
 
 ========================
@@ -3227,7 +3297,7 @@ def enforce_grounding_for_negation(question, context, answer):
 # ---------------------------------------------------
 # Ask Question
 # ---------------------------------------------------
-def ask_question(question, history=None, session_id=None):
+def ask_question(question, history=None, session_id=None, document_available=None):
 
     memory = None
     if session_id:
@@ -3332,7 +3402,7 @@ def ask_question(question, history=None, session_id=None):
         }
 
     query_type = _classify_query_type(question, history=history)
-    if query_type == "GENERAL_KNOWLEDGE":
+    if query_type == "GENERAL_KNOWLEDGE" and not document_available:
         _reset_vehicle_entity_context(session_id, history)
         answer = _build_knowledge_fallback_answer(
             question,
@@ -3349,7 +3419,7 @@ def ask_question(question, history=None, session_id=None):
             "evidence": {},
         }
 
-    if query_type == "FOLLOW_UP" and not _is_vehicle_question(question, history=history):
+    if query_type == "FOLLOW_UP" and not document_available and not _is_vehicle_question(question, history=history):
         answer = _build_knowledge_fallback_answer(
             question,
             history=history,
@@ -3367,7 +3437,7 @@ def ask_question(question, history=None, session_id=None):
 
     _track_vehicle_entity(question, session_id, history)
 
-    query_type = "AUTOMOTIVE"
+    query_type = "AUTOMOTIVE" if _is_vehicle_question(question, history=history) else "DOCUMENT"
     active_retriever = get_retriever(session_id=session_id)
 
     # Document-understanding route: summarise/outline the uploaded document
@@ -3448,7 +3518,8 @@ def ask_question(question, history=None, session_id=None):
             reverse=True,
         )
         if scored_docs and scored_docs[0][0] >= 1.5:
-            relevant_docs = [doc for _, doc in scored_docs[: min(3, len(scored_docs))]]
+            # A weak match must not pull unrelated procedures into the answer context.
+            relevant_docs = [scored_docs[0][1]]
 
     if not relevant_docs:
         _log_context_decision(
@@ -3457,17 +3528,27 @@ def ask_question(question, history=None, session_id=None):
             _topic_from_text(question),
             use_conversation_context,
         )
-        # For chat sessions with no uploaded documents, clearly state document unavailability
+        if document_available is None:
+            document_available = _session_has_ready_document(session_id)
+        # Distinguish a session with no document from a READY document that does not cover the question.
         if session_id:
-            knowledge_answer = (
-                "This chat session has no documents uploaded. "
-                "Based on general knowledge: " +
-                _build_knowledge_fallback_answer(
+            if document_available:
+                knowledge_answer = _build_knowledge_fallback_answer(
                     question,
                     history=history,
                     include_document_preface=False,
+                    document_available=True,
                 )
-            )
+            else:
+                knowledge_answer = (
+                    "This chat session has no documents uploaded. "
+                    "Based on general knowledge: "
+                    + _build_knowledge_fallback_answer(
+                        question,
+                        history=history,
+                        include_document_preface=False,
+                    )
+                )
         else:
             knowledge_answer = _build_knowledge_fallback_answer(
                 question,
@@ -3651,12 +3732,14 @@ def ask_question(question, history=None, session_id=None):
         }
 
     try:
+        answer_domain = "automotive" if _is_vehicle_question(question, history=history) else "the uploaded document's subject"
         answer_prompt = build_answer_prompt(
             question,
             context,
             history=effective_history,
             top_evidence=top_chunk,
             secondary_evidence=secondary_evidence_text,
+            document_domain=answer_domain,
         )
         draft_response = _invoke_llm(answer_prompt, stage="draft")
         draft_answer = draft_response.content.strip()
@@ -3671,6 +3754,7 @@ def ask_question(question, history=None, session_id=None):
             history=effective_history,
             top_evidence=top_chunk,
             secondary_evidence=secondary_evidence_text,
+            document_domain=answer_domain,
         )
         verified_response = _invoke_llm(verification_prompt, stage="verification")
         verified_answer = verified_response.content.strip()
@@ -3682,6 +3766,7 @@ def ask_question(question, history=None, session_id=None):
             history=effective_history,
             top_evidence=top_chunk,
             secondary_evidence=secondary_evidence_text,
+            document_domain=answer_domain,
         )
         rewritten_response = _invoke_llm(rewrite_prompt, stage="rewrite")
         final_answer = rewritten_response.content.strip()

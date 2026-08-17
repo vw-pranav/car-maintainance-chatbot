@@ -141,9 +141,31 @@ class ChatApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["filename"], "manual.pdf")
-        self.assertEqual(payload["status"], "indexed")
+        self.assertEqual(payload["status"], "READY")
         self.assertIn("size_kb", payload)
         self.assertIn("uploaded_at", payload)
+
+    def test_chat_during_processing_never_uses_automotive_fallback(self):
+        session_id = self.api_module.history_store.create_session("Document upload")
+        self.api_module.history_store.save_document(
+            session_id,
+            "research_paper.pdf",
+            1.0,
+            indexing_status="PROCESSING",
+        )
+
+        with patch("backend.api.get_backend_answer") as get_backend_answer:
+            response = self.client.post(
+                "/api/chat",
+                json={"message": "What is this document about?", "session_id": session_id},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["answer"],
+            "Your document is still being processed. Please wait a moment and try again.",
+        )
+        get_backend_answer.assert_not_called()
 
     def test_upload_endpoint_rejects_non_pdf(self):
         response = self.client.post(

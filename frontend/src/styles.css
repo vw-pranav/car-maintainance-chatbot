@@ -95,6 +95,20 @@ body {
   transition: transform 0.3s ease, opacity 0.3s ease;
 }
 
+.sidebar-history-icon {
+  display: none;
+  font-size: 1.35rem;
+  line-height: 1;
+}
+
+.sidebar-collapsed .sidebar-history-label {
+  display: none;
+}
+
+.sidebar-collapsed .sidebar-history-icon {
+  display: inline-block;
+}
+
 .sidebar-collapsed .sidebar {
   padding: 0.85rem 0.45rem;
 }
