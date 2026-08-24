@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import sys
+from datetime import datetime
 from typing import Any, Dict, List
 
 import httpx
@@ -454,7 +455,7 @@ def _classify_intent(question: str, history: List[Dict[str, Any]] | None = None)
     if normalized in FAREWELL_MARKERS or any(normalized.startswith(marker) for marker in FAREWELL_MARKERS):
         return "FAREWELL"
 
-    if _is_vehicle_question(question, history=history):
+    if _is_vehicle_question(question, history=history, include_history_context=False):
         return "QUESTION"
 
     question_starters = (
@@ -549,7 +550,40 @@ def _is_explanation_followup_question(question: str, history: List[Dict[str, Any
     if _is_followup_question(question, history=history):
         return True
     lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
-    return any(marker in lowered for marker in [" what if", "what happens if", "consequence", "risk", "effects", "why"])
+    return any(marker in lowered for marker in [" what if", "what happens if", "what happened if", "consequence", "risk", "effects", "why"])
+
+
+def _is_coolant_reuse_question(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    if not lowered:
+        return False
+    coolant_markers = ["coolant", "used coolant"]
+    reuse_markers = [
+        "reuse",
+        "reused",
+        "used again",
+        "use it again",
+        "put used coolant back",
+        "use the used coolant again",
+    ]
+    return any(marker in lowered for marker in coolant_markers) and any(marker in lowered for marker in reuse_markers)
+
+
+def _extract_coolant_no_reuse_line(context: str) -> str | None:
+    for line in _context_lines(context):
+        lowered = line.lower()
+        if any(
+            marker in lowered
+            for marker in [
+                "used coolant cannot be used again",
+                "used coolant cannot be reused",
+                "coolant cannot be reused",
+                "must not be reused",
+                "do not reuse",
+            ]
+        ):
+            return line.strip().rstrip(".")
+    return None
 
 
 def _extract_document_negation_facts(context: str) -> Dict[str, bool]:
@@ -595,10 +629,20 @@ def _build_consequence_answer_from_context(
     context: str,
     history: List[Dict[str, Any]] | None = None,
 ) -> str:
+    if _is_coolant_reuse_question(question):
+        support_line = _extract_coolant_no_reuse_line(context) or "used coolant cannot be used again"
+        return (
+            f"The documentation states that {support_line}.\n\n"
+            "The documentation does not explicitly explain the consequences.\n\n"
+            "Based on automotive knowledge:\n"
+            "Reused coolant may contain contaminants, degraded additives, or corrosion particles that reduce cooling-system protection and performance, increasing the risk of overheating and component wear."
+        )
+
     evidence = _extract_reasoning_evidence(question, context)
     support_line = (
         (evidence.get("requirement") or [None])[0]
         or (evidence.get("warning") or [None])[0]
+        or (evidence.get("specification") or [None])[0]
         or (evidence.get("procedure") or [None])[0]
         or _top_evidence_line(context, question)
         or "the retrieved documentation"
@@ -786,6 +830,28 @@ def _is_document_understanding_question(question: str) -> bool:
     return any(marker in lowered for marker in _DOCUMENT_UNDERSTANDING_MARKERS)
 
 
+def _is_current_date_question(question: str) -> bool:
+    lowered = re.sub(r"\s+", " ", (question or "").strip().lower())
+    if not lowered:
+        return False
+
+    date_markers = [
+        "today's date",
+        "todays date",
+        "what is today",
+        "what is the date today",
+        "what is todays date",
+        "current date",
+        "date today",
+    ]
+    return any(marker in lowered for marker in date_markers)
+
+
+def _build_current_date_answer() -> str:
+    today = datetime.now().strftime("%B %-d, %Y") if os.name != "nt" else datetime.now().strftime("%B %#d, %Y")
+    return f"Today is {today}."
+
+
 def _session_has_documents(session_id: Any) -> bool:
     if not session_id:
         return False
@@ -837,7 +903,13 @@ def _build_document_understanding_answer(
             break
 
     doc_label = ", ".join(doc_names) if doc_names else "the uploaded document"
-    context_text = "\n\n".join(collected_chunks[:10]) if collected_chunks else ""
+    if not collected_chunks:
+        return (
+            f"I can see **{doc_label}**, but I could not retrieve its content yet. "
+            "Please try again in a moment."
+        )
+
+    context_text = "\n\n".join(collected_chunks[:10])
 
     prompt = f"""You are GarageGPT, an automotive service manual assistant.
 
@@ -991,7 +1063,7 @@ def _build_knowledge_fallback_answer(
     include_document_preface: bool,
     document_available: bool = False,
 ) -> str:
-    vehicle_question = _is_vehicle_question(question, history=history)
+    vehicle_question = _is_vehicle_question(question, history=history, include_history_context=False)
     history_context = ""
     if history:
         recent_turns = []
@@ -1147,6 +1219,25 @@ def build_reasoning_answer_from_evidence(question: str, context: str) -> str | N
     reason_lines = evidence["reason"]
     question_lower = (question or "").lower()
 
+    if _is_coolant_reuse_question(question):
+        fact_line = _extract_coolant_no_reuse_line(context) or "used coolant cannot be used again"
+        if any(
+            marker in question_lower
+            for marker in ["what happens if", "what happened if", "what would happen if", "what will happen if", "what if"]
+        ):
+            return (
+                f"The documentation states that {fact_line}.\n\n"
+                "The documentation does not explicitly explain the consequences.\n\n"
+                "Based on automotive knowledge:\n"
+                "Reused coolant may contain contaminants, degraded additives, or corrosion particles that can reduce cooling-system protection and performance."
+            )
+
+        return (
+            f"{_REASON_NOT_EXPLICIT} It states that {fact_line}.\n\n"
+            "Based on automotive knowledge:\n"
+            "Used coolant can lose additive effectiveness and carry contamination, so reusing it can reduce corrosion protection and cooling reliability."
+        )
+
     if reason_lines:
         answer = reason_lines[0]
         return f"Documented Reason:\n{answer}"
@@ -1165,7 +1256,10 @@ def build_reasoning_answer_from_evidence(question: str, context: str) -> str | N
         support_lines.append("No explicit reason statement appears in the retrieved text.")
 
     fact_source = support_lines[0]
-    if question_lower.startswith("what happens if") or "what happens if" in question_lower or "what if" in question_lower:
+    if any(
+        marker in question_lower
+        for marker in ["what happens if", "what happened if", "what would happen if", "what will happen if", "what if"]
+    ):
         consequence = _build_automotive_why_explanation(question, context, history=None)
         return (
             f"The documentation states {fact_source.rstrip('.')}.\n\n"
@@ -1190,6 +1284,12 @@ def _build_automotive_why_explanation(
     context: str,
     history: List[Dict[str, Any]] | None = None,
 ) -> str:
+    if _is_coolant_reuse_question(question) or _extract_document_negation_facts(context).get("coolant_no_reuse"):
+        return (
+            "Reused coolant may contain contaminants, degraded additives, or corrosion particles "
+            "that can reduce cooling-system protection and performance."
+        )
+
     prompt = f"""
 You are GarageGPT.
 The service documentation does not provide an explicit reason.
@@ -1537,7 +1637,7 @@ _LIST_QUESTION_MARKERS = [
     "before starting",
     "before you start",
     "what checks",
-    "what must be",
+    "what must be checked",
     "what conditions",
     "what are the requirements",
     "what requirements",
@@ -1562,6 +1662,8 @@ _BULLET_LINE = re.compile(r"^\s*(?:[•\-\*\u2022\u25e6\u2023]|\d+[.):-])\s+")
 
 def _is_list_question(question: str) -> bool:
     q = (question or "").lower()
+    if "what must be done" in q and "after" in q:
+        return False
     return any(marker in q for marker in _LIST_QUESTION_MARKERS)
 
 
@@ -1630,7 +1732,7 @@ def extract_checklist_items(question: str, context: str) -> List[str]:
 
 def extract_tool_list(question: str, context: str) -> List[str]:
     question_lower = (question or "").lower()
-    if not any(term in question_lower for term in ["equipment", "tool", "tools", "required"]):
+    if not any(term in question_lower for term in ["equipment", "tool", "tools"]):
         return []
 
     lines = _join_wrapped_lines(_context_lines(context))
@@ -1834,7 +1936,7 @@ def build_table_structured_answer(question: str, context: str) -> str | None:
 
     question_lower = (question or "").lower()
 
-    if any(term in question_lower for term in ["equipment", "tool", "tools", "required"]):
+    if any(term in question_lower for term in ["equipment", "tool", "tools"]):
         tools = _extract_tool_values_from_table(rows)
         if tools:
             answer_lines = ["Required Equipment:"]
@@ -2214,6 +2316,8 @@ def _question_subject_tokens(question: str) -> List[str]:
         tokens.update({"cooling", "system"})
     if "used coolant" in lowered or "coolant" in lowered:
         tokens.add("coolant")
+    if any(marker in lowered for marker in ["reuse", "reused", "used again", "use it again", "put used coolant back"]):
+        tokens.update({"reuse", "reused"})
     if "engine/transmission" in lowered or "engine transmission" in lowered:
         tokens.update({"engine", "transmission"})
     if "diagnostic" in lowered or "menu" in lowered:
@@ -2234,6 +2338,12 @@ def _line_subject_score(question: str, line: str) -> int:
 def _line_is_subject_relevant(question: str, line: str, *, allow_reason_only: bool = False) -> bool:
     if not line:
         return False
+    if _is_coolant_reuse_question(question):
+        lowered = line.lower()
+        return (
+            "coolant" in lowered
+            and any(marker in lowered for marker in ["reuse", "reused", "used again", "must not", "cannot", "do not reuse"])
+        )
     if _line_subject_score(question, line) > 0:
         return True
     if not allow_reason_only:
@@ -2316,6 +2426,12 @@ def _topic_from_text(text: str) -> str:
         return "cooling system tester"
     if "fuel" in lowered and "pressure" in lowered:
         return "fuel pressure"
+    if "throttle" in lowered:
+        return "throttle control"
+    if "voltage" in lowered or "terminal" in lowered:
+        return "electrical specification"
+    if "ignition" in lowered:
+        return "ignition system"
     if "radiator" in lowered:
         return "radiator"
     if "transmission" in lowered:
@@ -2538,6 +2654,15 @@ def score_chunk_relevance(question, doc):
         "torque",
         "service",
         "inspection",
+        "fuel",
+        "pressure",
+        "idle",
+        "ignition",
+        "throttle",
+        "voltage",
+        "terminal",
+        "relay",
+        "j338",
     ]
     for term in domain_terms:
         if term in question_lower and (term in content_lower or term in section_lower):
@@ -2562,7 +2687,37 @@ def score_chunk_relevance(question, doc):
     if "engine" in content_lower and any(term in content_lower for term in ["transmission", "subframe", "assembly", "removal"]):
         score += 2.0
 
+    if "fuel" in question_lower and "pressure" in question_lower:
+        if "fuel" in content_lower and "pressure" in content_lower:
+            score += 4.0
+        if "idle" in question_lower and "idle" in content_lower:
+            score += 2.0
+
+    if "voltage" in question_lower:
+        if "voltage" in content_lower:
+            score += 4.0
+        if "terminal 15" in question_lower and "terminal 15" in content_lower:
+            score += 2.5
+
+    if "j338" in question_lower and "j338" in content_lower:
+        score += 4.0
+
     return round(score, 2)
+
+
+def _is_specification_question(question: str) -> bool:
+    lowered = (question or "").lower()
+    return any(
+        marker in lowered
+        for marker in [
+            "pressure",
+            "voltage",
+            "torque",
+            "specification",
+            "idle speed",
+            "what value",
+        ]
+    )
 
 
 def _is_engine_removal_question(question: str) -> bool:
@@ -2846,6 +3001,7 @@ def _is_explanatory_question(question: str) -> bool:
         "why not",
         "how come",
         "what happens if",
+        "what happened if",
         "what if",
         "what could happen",
         "what might happen",
@@ -3375,6 +3531,55 @@ def ask_question(question, history=None, session_id=None, document_available=Non
             "evidence_ids": snapshot.get("evidence_ids", []),
         }
 
+    if _is_current_date_question(question):
+        answer = _build_current_date_answer()
+        _log_intent_route("CURRENT_DATE", "RUNTIME")
+        return {
+            "question": question,
+            "answer": answer,
+            "context": "",
+            "confidence": "HIGH",
+            "evidence": {},
+        }
+
+    has_session_documents = _session_has_documents(session_id)
+    if document_available is None:
+        document_available = _session_has_ready_document(session_id)
+
+    if _is_document_understanding_question(question):
+        if has_session_documents and document_available:
+            doc_names = _get_session_document_names(session_id)
+            active_retriever = get_retriever(session_id=session_id)
+            answer = _build_document_understanding_answer(question, session_id, active_retriever, doc_names)
+            _log_intent_route("DOCUMENT_UNDERSTANDING", "DOCUMENT")
+            _log_execution_path("DOCUMENT_UNDERSTANDING", memory_used=False, retriever_used=True, answer_source="DOCUMENT")
+            return {
+                "question": question,
+                "answer": answer,
+                "context": "",
+                "confidence": "MEDIUM",
+                "evidence": {},
+            }
+
+        if has_session_documents and not document_available:
+            _log_intent_route("DOCUMENT_UNDERSTANDING", "INDEXING_GATE")
+            return {
+                "question": question,
+                "answer": "Your document is still being prepared. Please try again in a moment.",
+                "context": "",
+                "confidence": "LOW",
+                "evidence": {},
+            }
+
+        _log_intent_route("DOCUMENT_UNDERSTANDING", "NO_DOCUMENT")
+        return {
+            "question": question,
+            "answer": "No document is uploaded in this chat session yet. Please upload a PDF first.",
+            "context": "",
+            "confidence": "LOW",
+            "evidence": {},
+        }
+
     intent = _classify_intent(question, history=history)
     if intent in {"GREETING", "ACKNOWLEDGEMENT", "THANKS", "FAREWELL"}:
         answer = _build_conversational_answer(question, intent)
@@ -3387,21 +3592,43 @@ def ask_question(question, history=None, session_id=None, document_available=Non
             "evidence": {},
         }
     if intent == "GENERAL":
-        answer = _build_knowledge_fallback_answer(
-            question,
-            history=history,
-            include_document_preface=False,
+        normalized_question = re.sub(r"\s+", " ", (question or "").strip().lower())
+        question_starters = (
+            "what ",
+            "why ",
+            "how ",
+            "when ",
+            "where ",
+            "which ",
+            "can ",
+            "should ",
+            "do ",
+            "does ",
+            "is ",
+            "are ",
+            "will ",
+            "would ",
         )
-        _log_intent_route("GENERAL", "LLM")
-        return {
-            "question": question,
-            "answer": _present_answer(question, answer, confidence="MEDIUM"),
-            "context": "",
-            "confidence": "MEDIUM",
-            "evidence": {},
-        }
+        is_question_like = bool(normalized_question.endswith("?")) or any(
+            normalized_question.startswith(starter) for starter in question_starters
+        )
+        if not is_question_like:
+            answer = _build_knowledge_fallback_answer(
+                question,
+                history=None,
+                include_document_preface=False,
+            )
+            _log_intent_route("GENERAL", "LLM")
+            return {
+                "question": question,
+                "answer": _present_answer(question, answer, confidence="MEDIUM"),
+                "context": "",
+                "confidence": "MEDIUM",
+                "evidence": {},
+            }
 
     query_type = _classify_query_type(question, history=history)
+    fallback_history = None if query_type == "GENERAL_KNOWLEDGE" else history
     if query_type == "GENERAL_KNOWLEDGE" and not document_available:
         _reset_vehicle_entity_context(session_id, history)
         answer = _build_knowledge_fallback_answer(
@@ -3419,7 +3646,7 @@ def ask_question(question, history=None, session_id=None, document_available=Non
             "evidence": {},
         }
 
-    if query_type == "FOLLOW_UP" and not document_available and not _is_vehicle_question(question, history=history):
+    if query_type == "FOLLOW_UP" and not _is_vehicle_question(question, history=history, include_history_context=False):
         answer = _build_knowledge_fallback_answer(
             question,
             history=history,
@@ -3437,22 +3664,8 @@ def ask_question(question, history=None, session_id=None, document_available=Non
 
     _track_vehicle_entity(question, session_id, history)
 
-    query_type = "AUTOMOTIVE" if _is_vehicle_question(question, history=history) else "DOCUMENT"
+    query_type = "AUTOMOTIVE" if _is_vehicle_question(question, history=history, include_history_context=False) else "DOCUMENT"
     active_retriever = get_retriever(session_id=session_id)
-
-    # Document-understanding route: summarise/outline the uploaded document
-    if _is_document_understanding_question(question) and _session_has_documents(session_id):
-        doc_names = _get_session_document_names(session_id)
-        answer = _build_document_understanding_answer(question, session_id, active_retriever, doc_names)
-        _log_intent_route("DOCUMENT_UNDERSTANDING", "DOCUMENT")
-        _log_execution_path("DOCUMENT_UNDERSTANDING", memory_used=False, retriever_used=True, answer_source="DOCUMENT")
-        return {
-            "question": question,
-            "answer": answer,
-            "context": "",
-            "confidence": "MEDIUM",
-            "evidence": {},
-        }
 
     history_retriever = create_history_aware_retriever(active_retriever, memory_manager=memory)
     question_type, _ = history_retriever.classify_question_type(question)
@@ -3517,7 +3730,8 @@ def ask_question(question, history=None, session_id=None, document_available=Non
             key=lambda item: item[0],
             reverse=True,
         )
-        if scored_docs and scored_docs[0][0] >= 1.5:
+        minimum_weak_match = 4.0 if _is_specification_question(question) else 1.5
+        if scored_docs and scored_docs[0][0] >= minimum_weak_match:
             # A weak match must not pull unrelated procedures into the answer context.
             relevant_docs = [scored_docs[0][1]]
 
@@ -3535,7 +3749,7 @@ def ask_question(question, history=None, session_id=None, document_available=Non
             if document_available:
                 knowledge_answer = _build_knowledge_fallback_answer(
                     question,
-                    history=history,
+                    history=fallback_history,
                     include_document_preface=False,
                     document_available=True,
                 )
@@ -3545,14 +3759,14 @@ def ask_question(question, history=None, session_id=None, document_available=Non
                     "Based on general knowledge: "
                     + _build_knowledge_fallback_answer(
                         question,
-                        history=history,
+                        history=fallback_history,
                         include_document_preface=False,
                     )
                 )
         else:
             knowledge_answer = _build_knowledge_fallback_answer(
                 question,
-                history=history,
+                history=fallback_history,
                 include_document_preface=True,
             )
         _log_intent_route("QUESTION", "LLM")
@@ -3631,7 +3845,7 @@ def ask_question(question, history=None, session_id=None, document_available=Non
             "evidence": top_evidence,
         }
 
-    if question_type == "Follow-up" and _is_consequence_followup_question(question):
+    if _is_consequence_followup_question(question):
         consequence_answer = _build_consequence_answer_from_context(question, top_chunk or context, history=history)
         _log_routing_decision(
             "AUTOMOTIVE",
@@ -3732,7 +3946,7 @@ def ask_question(question, history=None, session_id=None, document_available=Non
         }
 
     try:
-        answer_domain = "automotive" if _is_vehicle_question(question, history=history) else "the uploaded document's subject"
+        answer_domain = "automotive" if _is_vehicle_question(question, include_history_context=False) else "the uploaded document's subject"
         answer_prompt = build_answer_prompt(
             question,
             context,
@@ -3806,14 +4020,14 @@ def ask_question(question, history=None, session_id=None, document_available=Non
         if is_fallback_answer(final_answer) or "i could not find that information" in final_answer.lower():
             final_answer = _build_knowledge_fallback_answer(
                 question,
-                history=history,
+                history=fallback_history,
                 include_document_preface=True,
             )
     except Exception as exc:
         logger.exception("LLM invocation failed; using evidence-based fallback answer.")
         final_answer = _build_knowledge_fallback_answer(
             question,
-            history=history,
+            history=fallback_history,
             include_document_preface=bool(cleaned_chunks),
         )
 

@@ -14,7 +14,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.append(str(SRC))
 
-from chatbot import ask_question
+from chatbot import ask_question, _is_document_understanding_question
 from config import PDF_DIRECTORY
 from history_db import HistoryStore
 from loaders.pdf_loader import load_pdfs
@@ -237,6 +237,12 @@ def health_check():
 def chat(request: ChatRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
+
+    if request.session_id is None and _is_document_understanding_question(request.message):
+        raise HTTPException(
+            status_code=400,
+            detail="session_id is required for document-summary questions. Upload or open a session first.",
+        )
 
     try:
         session_id = _ensure_session(request.session_id)

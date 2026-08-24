@@ -130,6 +130,55 @@ class ChatbotGroundingTests(unittest.TestCase):
             __import__("chatbot").retriever = original_retriever
             __import__("chatbot")._build_knowledge_fallback_answer = original_fallback
 
+    def test_general_question_after_document_topic_does_not_reuse_automotive_history(self):
+        module = __import__("chatbot")
+        captured = {"history": "unset"}
+
+        class EmptyRetriever:
+            def invoke(self, query):
+                return []
+
+        def fake_general_answer(
+            question,
+            history=None,
+            include_document_preface=False,
+            document_available=False,
+        ):
+            captured["history"] = history
+            return "Python is a general-purpose programming language."
+
+        history = [
+            {"role": "user", "content": "What is this document about?"},
+            {"role": "assistant", "content": "This document covers Audi engine repairs."},
+            {"role": "user", "content": "For the EA839 engine, can used coolant be reused?"},
+            {"role": "assistant", "content": "No. Used coolant should not be reused."},
+        ]
+        original_values = (
+            module.get_retriever,
+            module._session_has_documents,
+            module._build_knowledge_fallback_answer,
+        )
+        try:
+            module.get_retriever = lambda session_id=None: EmptyRetriever()
+            module._session_has_documents = lambda session_id: True
+            module._build_knowledge_fallback_answer = fake_general_answer
+
+            result = ask_question(
+                "what is python?",
+                history=history,
+                session_id=989898,
+                document_available=True,
+            )
+
+            self.assertIn("Python", result["answer"])
+            self.assertIsNone(captured["history"])
+        finally:
+            (
+                module.get_retriever,
+                module._session_has_documents,
+                module._build_knowledge_fallback_answer,
+            ) = original_values
+
     def test_general_followup_uses_general_context_not_retrieval(self):
         class FailRetriever:
             def invoke(self, query):

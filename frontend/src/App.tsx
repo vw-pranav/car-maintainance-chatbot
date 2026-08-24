@@ -184,6 +184,10 @@ function App() {
   };
 
   const handleSendMessage = async () => {
+    if (isUploading) {
+      return;
+    }
+
     const trimmed = inputValue.trim();
     if (!trimmed) {
       return;
@@ -451,7 +455,7 @@ function App() {
                 Upload
               </GroupuiButton>
             </span>
-            <GroupuiButton onClick={() => void handleSendMessage()} disabled={isLoading || isTyping}>
+            <GroupuiButton onClick={() => void handleSendMessage()} disabled={isUploading || isLoading || isTyping}>
               Send
             </GroupuiButton>
           </div>
@@ -463,7 +467,7 @@ function App() {
           <div className="upload-overlay-panel">
             <GroupuiLoading />
             <p className="upload-overlay-title">Preparing your document</p>
-            <p className="upload-overlay-subtitle">Chunking and embedding are running for this chat session.</p>
+            <p className="upload-overlay-subtitle">wait until uploading is over</p>
           </div>
         </div>
       ) : null}
